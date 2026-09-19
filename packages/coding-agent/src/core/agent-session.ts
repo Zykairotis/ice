@@ -331,6 +331,12 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	// Serializes compact() and _runAutoCompaction(). Claimed synchronously before any
+	// await so a second compaction path can never prepare from the same branch and
+	// append a duplicate compaction entry.
+	private _compactionInFlight = false;
+	private _compactionSettled: Promise<void> = Promise.resolve();
+	private _compactionUnlock: (() => void) | undefined = undefined;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1191,6 +1197,12 @@ export class AgentSession {
 				}
 			}
 
+			// Hot-reload skills before expansion so /skill:name and the system prompt see the current set.
+			// Deferred while streaming to avoid swapping the system prompt mid-run; the next idle prompt picks it up.
+			if (!this.isStreaming) {
+				this.refreshSkills();
+			}
+
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
@@ -1861,17 +1873,44 @@ export class AgentSession {
 		return settings;
 	}
 
+	private _claimCompactionLock(): void {
+		this._compactionInFlight = true;
+		this._compactionSettled = new Promise<void>((resolve) => {
+			this._compactionUnlock = resolve;
+		});
+	}
+
+	private _releaseCompactionLock(): void {
+		if (!this._compactionInFlight) return;
+		this._compactionInFlight = false;
+		const unlock = this._compactionUnlock;
+		this._compactionUnlock = undefined;
+		unlock?.();
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
-		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		if (this._compactionInFlight) {
+			// Preempt an in-flight compaction so a manual or extension compaction -
+			// possibly with custom instructions - takes over. Two concurrent
+			// compactions would both prepare from the same branch and append
+			// duplicate compaction entries.
+			this.abortCompaction();
+			while (this._compactionInFlight) {
+				await this._compactionSettled;
+			}
+		}
+		this._claimCompactionLock();
 
 		try {
+			await this.abort();
+			this._compactionAbortController = new AbortController();
+			this._emit({ type: "compaction_start", reason: "manual" });
+
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
@@ -2005,6 +2044,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			this._releaseCompactionLock();
 		}
 	}
 
@@ -2044,6 +2084,7 @@ export class AgentSession {
 			!settings.enabled ||
 			!this.model ||
 			signal?.aborted ||
+			this._compactionInFlight ||
 			this._autoCompactionAbortController !== undefined ||
 			this._compactionAbortController !== undefined
 		) {
@@ -2181,6 +2222,13 @@ export class AgentSession {
 	 * Internal: Run auto-compaction with events.
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		// Another compaction (manual, extension-triggered, or a prior auto path) owns
+		// the compaction lock. It will handle the context; running concurrently would
+		// prepare from the same branch and append a duplicate compaction entry.
+		if (this._compactionInFlight) {
+			return false;
+		}
+		this._claimCompactionLock();
 		const settings = this.getCompactionSettingsForModel();
 		let started = false;
 
@@ -2328,15 +2376,21 @@ export class AgentSession {
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			// The lock owner can abort this compaction to preempt it (compact() takes
+			// over); report that as a cancellation, not a failure.
+			const aborted =
+				(error instanceof Error && error.name === "AbortError") ||
+				this._autoCompactionAbortController?.signal.aborted === true;
 			if (started) {
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted,
 					willRetry: false,
-					errorMessage:
-						reason === "overflow"
+					errorMessage: aborted
+						? undefined
+						: reason === "overflow"
 							? `Context overflow recovery failed: ${errorMessage}`
 							: `Auto-compaction failed: ${errorMessage}`,
 				});
@@ -2344,6 +2398,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			this._releaseCompactionLock();
 		}
 	}
 
@@ -2741,6 +2796,18 @@ export class AgentSession {
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
+	}
+
+	/**
+	 * Hot-reload skills: re-scan skill sources and, when any skill was added, updated, or deleted,
+	 * reload the skill set and rebuild the system prompt so both model-visible skills and
+	 * /skill:name commands reflect the current state. Returns true when skills changed.
+	 */
+	refreshSkills(): boolean {
+		if (!this._resourceLoader.refreshSkillsIfChanged()) return false;
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
+		return true;
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
