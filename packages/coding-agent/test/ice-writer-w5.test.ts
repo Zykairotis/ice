@@ -129,6 +129,17 @@ function registeredWriterTools(options: { verifier?: string; active?: string[] }
 	};
 }
 
+/** delegate_write always returns an accepted handle; wait on it for the terminal writer result. */
+async function settleWriter(tools: W5Tools, context: unknown, launched: W5ToolResult): Promise<W5ToolResult> {
+	const accepted = (launched.details as { accepted?: { runId: string } } | undefined)?.accepted;
+	if (!accepted) return launched;
+	const waited = await tools
+		.get("manage_subagent")
+		.execute("w5-wait", { action: "wait", runId: accepted.runId, waitMs: 60_000 }, undefined, undefined, context);
+	const result = (waited.details as { writer?: { result?: WriterResult } }).writer?.result;
+	return { isError: result?.status !== "completed", details: { result } };
+}
+
 function toolDetails<T>(result: W5ToolResult): T {
 	return result.details as T;
 }
@@ -201,17 +212,20 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 		try {
 			const tools = registeredWriterTools({ verifier: verifier(0) });
 			const context = writerContext(cwd, modelRegistry, model);
-			const delegated = await tools.get("delegate_write").execute(
-				"w5-delegate",
-				{
-					task: "Create src/child.ts with one line.",
-					baseCommit: head,
-					scope: { roots: ["src"] },
-					background: false,
-				},
-				undefined,
-				undefined,
+			const delegated = await settleWriter(
+				tools,
 				context,
+				await tools.get("delegate_write").execute(
+					"w5-delegate",
+					{
+						task: "Create src/child.ts with one line.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					context,
+				),
 			);
 			expect(delegated).toMatchObject({ isError: false, details: { result: { status: "completed" } } });
 			const result = toolDetails<{ result: WriterResult }>(delegated).result;
@@ -453,17 +467,20 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 				new ModelRegistry(await ModelRuntime.create({ modelsPath: null })),
 				undefined,
 			);
-			const failed = await tools.get("delegate_write").execute(
-				"failed",
-				{
-					task: "Fail the writer by denying its complete capability.",
-					baseCommit: head,
-					scope: { roots: ["src"] },
-					background: false,
-				},
-				undefined,
-				undefined,
+			const failed = await settleWriter(
+				tools,
 				failedContext,
+				await tools.get("delegate_write").execute(
+					"failed",
+					{
+						task: "Fail the writer by denying its complete capability.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					failedContext,
+				),
 			);
 			expect(failed).toMatchObject({ isError: true, details: { result: { status: "failed" } } });
 			expect(toolDetails<{ result: WriterResult }>(failed).result.patchArtifact).toBeUndefined();
@@ -474,7 +491,7 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 				.get("delegate_write")
 				.execute(
 					"cancelled",
-					{ task: "Cancel before startup.", baseCommit: head, scope: { roots: ["src"] }, background: false },
+					{ task: "Cancel before startup.", baseCommit: head, scope: { roots: ["src"] } },
 					cancelledController.signal,
 					undefined,
 					context,
@@ -488,18 +505,21 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 					return fauxAssistantMessage("late");
 				},
 			]);
-			const longRunning = await tools.get("delegate_write").execute(
-				"long-running",
-				{
-					task: "Continue until the bounded final report is ready.",
-					baseCommit: head,
-					scope: { roots: ["src"] },
-					startupTimeoutMs: 5,
-					background: false,
-				},
-				undefined,
-				undefined,
+			const longRunning = await settleWriter(
+				tools,
 				context,
+				await tools.get("delegate_write").execute(
+					"long-running",
+					{
+						task: "Continue until the bounded final report is ready.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+						startupTimeoutMs: 5,
+					},
+					undefined,
+					undefined,
+					context,
+				),
 			);
 			expect(longRunning).toMatchObject({ isError: false, details: { result: { status: "completed" } } });
 			expect(toolDetails<{ result: WriterResult }>(longRunning).result.patchArtifact).toMatchObject({

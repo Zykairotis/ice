@@ -178,6 +178,35 @@ type AsyncToolHarnessOptions = {
 	trusted?: boolean;
 };
 
+type ManagedToolLike = { execute: (...args: unknown[]) => Promise<unknown> };
+type SettledToolResult = { isError: boolean; content: Array<{ text: string }>; details: Record<string, unknown> };
+
+/** Delegate always returns a managed handle; wait for the terminal presentation and merge it with the launch. */
+async function settleManagedDelegate(
+	tools: ReadonlyMap<string, ManagedToolLike>,
+	context: ExtensionContext,
+	launched: unknown,
+): Promise<SettledToolResult> {
+	const launch = launched as SettledToolResult;
+	const managed = launch.details?.managed as { runId: string } | undefined;
+	if (!managed) return launch;
+	const waited = (await tools
+		.get("manage_subagent")!
+		.execute(
+			"settle-managed",
+			{ action: "wait", runId: managed.runId, waitMs: 60_000 },
+			undefined,
+			undefined,
+			context,
+		)) as SettledToolResult;
+	const observation = waited.details.observation as { result?: SubagentResult } | undefined;
+	return {
+		isError: waited.isError || observation?.result?.status !== "completed",
+		content: waited.content,
+		details: { ...launch.details, ...waited.details, result: observation?.result },
+	};
+}
+
 async function createAsyncToolHarness(options: AsyncToolHarnessOptions = {}) {
 	const cwd = await createWorkspace();
 	const agentDir = options.agentDir ?? join(cwd, ".ice-agent");
@@ -1192,10 +1221,9 @@ describe("ICE subagent contracts", () => {
 			harness.faux.setResponses([
 				fauxAssistantMessage('{"summary":"Batch child completed.","evidence":{"paths":["src"]},"findings":[]}'),
 			]);
-			const batch = await harness.tools.get("delegate_batch")!.execute(
+			const batchLaunch = await harness.tools.get("delegate_batch")!.execute(
 				"batch-launch",
 				{
-					background: false,
 					tasks: [
 						{
 							id: "batch-task",
@@ -1213,8 +1241,24 @@ describe("ICE subagent contracts", () => {
 				undefined,
 				harness.context,
 			);
-			expect(batch).toMatchObject({ isError: false, details: { result: { batchId: expect.any(String) } } });
-			const batchResult = batch.details.result as {
+			expect(batchLaunch).toMatchObject({ isError: false, details: { accepted: { batchId: expect.any(String) } } });
+			let batchInspection: { details: { inspection: { result?: unknown } } } | undefined;
+			await vi.waitFor(
+				async () => {
+					batchInspection = await harness.tools
+						.get("inspect_subagent_batch")!
+						.execute(
+							"batch-inspect",
+							{ batchId: batchLaunch.details.accepted.batchId },
+							undefined,
+							undefined,
+							harness.context,
+						);
+					expect(batchInspection!.details.inspection.result).toBeDefined();
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			const batchResult = batchInspection!.details.inspection.result as {
 				batchId: string;
 				items: Array<{ taskId: string; result: { runId: string } }>;
 			};
@@ -1222,7 +1266,7 @@ describe("ICE subagent contracts", () => {
 			const batchId = batchResult.batchId;
 			const taskId = batchResult.items[0]!.taskId;
 			const batchRunId = batchResult.items[0]!.result.runId;
-			for (const runId of [batchId, taskId, batchRunId]) {
+			for (const runId of [batchId, taskId]) {
 				const rejected = await manage.execute(
 					"batch-as-foreground",
 					{ runId, action: "peek" },
@@ -1233,6 +1277,15 @@ describe("ICE subagent contracts", () => {
 				expect(rejected).toMatchObject({ isError: true });
 				expect(rejected.content[0].text).toMatch(/foreground runId.*batchId.*taskId/i);
 			}
+			// Managed batch children are individually manageable by their own runId.
+			const managedChild = await manage.execute(
+				"batch-child-peek",
+				{ runId: batchRunId, action: "peek" },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(managedChild).toMatchObject({ isError: false });
 			for (const candidateJobId of [batchId, taskId, `job:${jobId}`]) {
 				const rejected = await inspectJob.execute(
 					"batch-as-job",
@@ -2210,7 +2263,7 @@ describe("ICE subagent contracts", () => {
 				.get("delegate_write")!
 				.execute(
 					"model-writer",
-					{ task: "Edit source.", baseCommit: "a".repeat(40), scope: { roots: ["src"] }, background: false },
+					{ task: "Edit source.", baseCommit: "a".repeat(40), scope: { roots: ["src"] } },
 					undefined,
 					undefined,
 					harness.context,
@@ -2450,13 +2503,14 @@ describe("ICE subagent contracts", () => {
 			.get("delegate_write")!
 			.execute(
 				"writer-without-preflight",
-				{ task: "Change source.", baseCommit: "0".repeat(40), scope: { roots: ["src"] }, background: false },
+				{ task: "Change source.", baseCommit: "0".repeat(40), scope: { roots: ["src"] } },
 				undefined,
 				undefined,
 				harness.context,
 			);
 		expect(result).toMatchObject({ isError: false });
-		expect(result.content[0].text).toMatch(/YOLO direct parent workspace|no isolation/i);
+		expect(result.details).toMatchObject({ accepted: { workspaceIsolation: "parent" } });
+		expect(result.content[0].text).toMatch(/explicitly authorized parent workspace/i);
 	});
 
 	it("defines configurable subagent attachment and expansion actions", () => {
@@ -5788,18 +5842,21 @@ describe("ICE subagent contracts", () => {
 					'{"summary":"The concurrency headroom document was created and explains configuration and precedence.","evidence":{"paths":["src/ice-subagent-concurrency.ts"]}}',
 				),
 			]);
-			const result = await harness.tools.get("delegate")!.execute(
-				"plain-json-fallback",
-				{
-					role: "self",
-					self: { instructions: "Inspect the approved scope.", capabilities: ["read"] },
-					task: "Inspect the concurrency implementation.",
-					scope: { roots: ["src"] },
-					background: false,
-				},
-				undefined,
-				undefined,
+			const result = await settleManagedDelegate(
+				harness.tools,
 				harness.context,
+				await harness.tools.get("delegate")!.execute(
+					"plain-json-fallback",
+					{
+						role: "self",
+						self: { instructions: "Inspect the approved scope.", capabilities: ["read"] },
+						task: "Inspect the concurrency implementation.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
 			);
 			const text = result.content[0]?.text ?? "";
 			expect(result).toMatchObject({ isError: false });
@@ -8598,7 +8655,22 @@ describe("ICE subagent contracts", () => {
 				path: "/tmp/output.txt",
 			}),
 		).toBe(false);
-		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("background");
+		for (const name of ["delegate", "delegate_async", "delegate_batch", "review_batch", "delegate_write"]) {
+			expect(tools.get(name)?.parameters.properties).not.toHaveProperty("background");
+			expect(tools.get(name)?.description).not.toMatch(/background:\s*false/);
+		}
+		const delegateSchema = tools.get("delegate")?.parameters;
+		const delegateCall = { role: "self", task: "Inspect.", scope: { roots: ["src"] } };
+		expect(Value.Check(delegateSchema, delegateCall)).toBe(true);
+		expect(Value.Check(delegateSchema, { ...delegateCall, background: false })).toBe(false);
+		expect(
+			Value.Check(tools.get("delegate_write")?.parameters, {
+				task: "Edit.",
+				baseCommit: "a".repeat(40),
+				scope: { roots: ["src"] },
+				background: false,
+			}),
+		).toBe(false);
 		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("queue");
 		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("plannedOutputBytes");
 		for (const name of ["delegate", "delegate_async", "delegate_batch", "review_batch"]) {
@@ -8883,21 +8955,24 @@ describe("ICE subagent contracts", () => {
 					return fauxAssistantMessage('{"summary":"context applied","evidence":{"paths":["src"]}}');
 				},
 			]);
-			const result = await harness.tools.get("delegate").execute(
-				"hook-context",
-				{
-					role: "self",
-					self: {
-						instructions: "Inspect the approved scope and report evidence.",
-						capabilities: ["read", "grep", "find", "ls"],
-					},
-					task: "Inspect the source tree.",
-					scope: { roots: ["src"] },
-					background: false,
-				},
-				undefined,
-				undefined,
+			const result = await settleManagedDelegate(
+				harness.tools,
 				harness.context,
+				await harness.tools.get("delegate").execute(
+					"hook-context",
+					{
+						role: "self",
+						self: {
+							instructions: "Inspect the approved scope and report evidence.",
+							capabilities: ["read", "grep", "find", "ls"],
+						},
+						task: "Inspect the source tree.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
 			);
 			expect(result).toMatchObject({ isError: false });
 			expect(contexts.some((context) => JSON.stringify(context.messages).includes("hook note"))).toBe(true);
@@ -9443,21 +9518,24 @@ describe("ICE subagent contracts", () => {
 		const finalAnswer = "large final answer 🌿\\n".repeat(900);
 		try {
 			harness.faux.setResponses([fauxAssistantMessage(finalAnswer)]);
-			const launched = await harness.tools.get("delegate")!.execute(
-				"read-output-launch",
-				{
-					role: "self",
-					self: {
-						instructions: "Inspect the approved scope and report the requested fact.",
-						capabilities: ["read"],
-					},
-					task: "Inspect the source tree and return the final answer.",
-					scope: { roots: ["src"] },
-					background: false,
-				},
-				undefined,
-				undefined,
+			const launched = await settleManagedDelegate(
+				harness.tools,
 				harness.context,
+				await harness.tools.get("delegate")!.execute(
+					"read-output-launch",
+					{
+						role: "self",
+						self: {
+							instructions: "Inspect the approved scope and report the requested fact.",
+							capabilities: ["read"],
+						},
+						task: "Inspect the source tree and return the final answer.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
 			);
 			expect(launched).toMatchObject({ isError: false });
 			const result = (launched.details as { result: SubagentResult }).result;

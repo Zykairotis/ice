@@ -263,6 +263,7 @@ export const SUBAGENT_PROFILE_LIMITS = {
 
 /** Conservative per-call ceiling for a management `wait`; expiry is never a child timeout. */
 export const SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS = 60_000;
+const SUBAGENT_MANAGED_REQUEST_LIMIT = 256;
 export const SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS = 30_000;
 /** Bounded number of settled detached-run terminal results retained for post-terminal management. */
 const SUBAGENT_RETAINED_RESULT_LIMIT = 32;
@@ -10988,23 +10989,6 @@ const delegateParameters = Type.Object(
 
 const delegateAsyncParameters = delegateParameters;
 
-/**
- * The foreground `delegate` tool accepts one extra control-plane option: a
- * managed launch that returns a retained handle at admission. The durable async
- * job surface keeps its own acceptance contract and does not expose it.
- */
-const delegateForegroundParameters = Type.Object(
-	{
-		...delegateParameters.properties,
-		background: Type.Optional(
-			Type.Boolean({
-				description:
-					"Defaults to true: return a retained managed handle when the child starts. Set false to wait for its result.",
-			}),
-		),
-	},
-	{ additionalProperties: false },
-);
 const listSubagentProfilesParameters = Type.Object({
 	query: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
@@ -11088,21 +11072,18 @@ const writerPatchWorkflowParameters = Type.Object({
 	artifact: writerPatchArtifactParameters,
 });
 
-const delegateWriteParameters = Type.Object({
-	task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
-	baseCommit: Type.String({ pattern: "^[0-9a-f]{40}$", minLength: 40, maxLength: 40 }),
-	scope: Type.Object({
-		roots: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 16 }),
-	}),
-	checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
-	background: Type.Optional(
-		Type.Boolean({
-			description:
-				"Defaults to true: return after clean parent/worktree preflight; manage the same writer run with manage_subagent.",
+const delegateWriteParameters = Type.Object(
+	{
+		task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
+		baseCommit: Type.String({ pattern: "^[0-9a-f]{40}$", minLength: 40, maxLength: 40 }),
+		scope: Type.Object({
+			roots: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 16 }),
 		}),
-	),
-	startupTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: WRITER_MAX_TIMEOUT_MS })),
-});
+		checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
+		startupTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: WRITER_MAX_TIMEOUT_MS })),
+	},
+	{ additionalProperties: false },
+);
 
 const delegateBatchTaskParameters = Type.Object(
 	{
@@ -11127,9 +11108,6 @@ const delegateBatchTaskParameters = Type.Object(
 const delegateBatchParameters = Type.Object(
 	{
 		tasks: Type.Array(delegateBatchTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
-		background: Type.Optional(
-			Type.Boolean({ description: "Defaults to true: return an owner-scoped batch handle after admission." }),
-		),
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
 		failFast: Type.Optional(Type.Boolean()),
 	},
@@ -11166,9 +11144,6 @@ const reviewTaskParameters = Type.Object(
 const reviewBatchParameters = Type.Object(
 	{
 		tasks: Type.Array(reviewTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
-		background: Type.Optional(
-			Type.Boolean({ description: "Defaults to true: return an owner-scoped review handle after admission." }),
-		),
 		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
 		failFast: Type.Optional(Type.Boolean()),
 	},
@@ -11208,7 +11183,7 @@ type DelegateToolResult =
 			launch: SubagentLaunchProvenance;
 	  }
 	| SubagentToolErrorDetails;
-type DelegateTool = ToolDefinition<typeof delegateForegroundParameters, DelegateToolResult | undefined>;
+type DelegateTool = ToolDefinition<typeof delegateParameters, DelegateToolResult | undefined>;
 
 type DelegateAsyncTool = ToolDefinition<
 	typeof delegateAsyncParameters,
@@ -11407,7 +11382,29 @@ function formatSubagentCheckInState(state: SubagentCheckInState | undefined): st
 		.join(" ");
 }
 
-function formatManagedObservation(observation: SubagentManagedObservation): string {
+/** Parent-facing, pathless description of where the complete final answer lives. */
+export function formatSubagentOutputReference(output: SubagentOutput | undefined): string | undefined {
+	if (!output || output.captureStatus === "inline_complete") return undefined;
+	if (output.captureStatus === "artifact_unavailable" || !output.artifact) {
+		return `Final answer (${output.originalBytes} bytes) exceeded the inline limit and could not be retained; only the inline prefix is available.`;
+	}
+	const artifact = output.artifact;
+	return `Complete final answer retained as output artifact ${artifact.id} (${artifact.storedBytes} of ${artifact.originalBytes} bytes stored${artifact.truncated ? ", truncated at the host storage limit" : ""}). Read it with read_subagent_output using artifactId ${artifact.id}.`;
+}
+
+function formatManagedObservation(
+	observation: SubagentManagedObservation,
+	verification?: SubagentVerification,
+): string {
+	if (observation.result && verification) {
+		const header = [`Subagent ${observation.runId} is ${observation.childState}.`];
+		const checkIn = formatSubagentCheckInState(observation.checkIn);
+		if (checkIn) header.push(checkIn);
+		return truncateSubagentOutput(
+			redactCredentialText([...header, formatToolResult(observation.result, verification)].join("\n")),
+			16 * 1024,
+		).text;
+	}
 	const lines = [`Subagent ${observation.runId} is ${observation.childState}.`];
 	const checkIn = formatSubagentCheckInState(observation.checkIn);
 	if (checkIn) lines.push(checkIn);
@@ -11421,6 +11418,8 @@ function formatManagedObservation(observation: SubagentManagedObservation): stri
 			`Terminal result: ${observation.result.status} · ${observation.result.summary}`,
 			...(observation.result.partial ? ["The result is partial; treat it as unverified evidence."] : []),
 		);
+		const outputReference = formatSubagentOutputReference(observation.result.output);
+		if (outputReference) lines.push(outputReference);
 	}
 	if (observation.attention) {
 		lines.push(formatRuntimeAttention(observation.attention));
@@ -11475,9 +11474,7 @@ function formatToolResult(result: SubagentResult, verification: SubagentVerifica
 			: `Parent verification: failed. ${verification.reason}`,
 		...(requirementRows.length > 0 ? [requirementRows.join("\n")] : []),
 		...(artifactRows.length > 0 ? [artifactRows.join("\n")] : []),
-		result.reportArtifact
-			? `Oversized report capture: ${result.reportArtifact.path} (${result.reportArtifact.originalBytes} bytes${result.reportArtifact.truncated ? ", artifact truncated" : ""}).`
-			: undefined,
+		formatSubagentOutputReference(result.output),
 		result.attention ? formatRuntimeAttention(result.attention) : undefined,
 		verification.unresolvedClaims.length > 0
 			? `Unresolved claims for parent synthesis: ${verification.unresolvedClaims.join(" | ")}`
@@ -13122,6 +13119,28 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		const checkIn = checkIns.get(ownerSessionId)?.getState(observation.runId);
 		return checkIn ? { ...observation, checkIn } : observation;
 	};
+	// Accepted requests of managed delegate runs so terminal observations get the same parent
+	// verification the synchronous path produced. Bounded; oldest entries are dropped first.
+	const managedRequests = new Map<string, NormalizedSubagentRequest>();
+	const managedRequestKey = (ownerSessionId: string, runId: string): string => `${ownerSessionId}\u0000${runId}`;
+	const rememberManagedRequest = (request: NormalizedSubagentRequest): void => {
+		const key = managedRequestKey(request.parentSessionId, request.runId);
+		managedRequests.delete(key);
+		managedRequests.set(key, request);
+		while (managedRequests.size > SUBAGENT_MANAGED_REQUEST_LIMIT) {
+			const oldest = managedRequests.keys().next().value;
+			if (oldest === undefined) break;
+			managedRequests.delete(oldest);
+		}
+	};
+	const managedVerificationFor = (
+		ownerSessionId: string,
+		observation: SubagentManagedObservation,
+	): SubagentVerification | undefined => {
+		if (!observation.result) return undefined;
+		const request = managedRequests.get(managedRequestKey(ownerSessionId, observation.result.runId));
+		return request ? verifySubagentResult(observation.result, request) : undefined;
+	};
 	const managedBatches = new Map<string, ManagedSubagentBatchRecord>();
 	const managedBatchOutputReference = (batchId: string): string => `batch:${batchId}`;
 	const releaseManagedBatchOutput = (record: ManagedSubagentBatchRecord): void => {
@@ -13569,7 +13588,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		label: "delegate_write",
 		executionMode: "sequential",
 		description:
-			"Run one foreground ICE writer. Normal mode uses a clean detached Git worktree and returns an immutable bounded patch proposal. Explicit --sub-yolo uses the trusted parent workspace directly, including dirty files, and may use Bash; it provides no isolation, rollback, or patch proposal. The child always uses the current parent model.",
+			"Run one managed ICE writer and return its handle after clean parent/worktree preflight; inspect or stop it with manage_subagent. Normal mode uses a clean detached Git worktree and returns an immutable bounded patch proposal. Explicit --sub-yolo uses the trusted parent workspace directly, including dirty files, and may use Bash; it provides no isolation, rollback, or patch proposal. The child always uses the current parent model.",
 		promptSnippet: "Delegate one bounded writer (isolated normally, direct in YOLO)",
 		parameters: delegateWriteParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("delegate_write", args, theme, context),
@@ -13603,7 +13622,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				});
 				normalizedRequest = normalized;
 				const model = requireParentModel(ctx);
-				const managedLaunch = params.background !== false;
 				const checkInIntervalMs = params.checkInIntervalMs ?? SUBAGENT_CHECKIN_INTERVAL_MS;
 				if (!Number.isSafeInteger(checkInIntervalMs) || checkInIntervalMs < SUBAGENT_CHECKIN_INTERVAL_MS) {
 					throw new SubagentError(
@@ -13611,13 +13629,11 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						`checkInIntervalMs must be an integer of at least ${SUBAGENT_CHECKIN_INTERVAL_MS} ms.`,
 					);
 				}
-				if (managedLaunch) {
-					reserveManagedWriterAdmission();
-					admissionReserved = true;
-				}
+				reserveManagedWriterAdmission();
+				admissionReserved = true;
 				const controller = new AbortController();
 				writerController = controller;
-				if (managedLaunch) managedWriterControllers.add(controller);
+				managedWriterControllers.add(controller);
 				const abortWriter = (): void => controller.abort();
 				if (signal) {
 					if (signal.aborted) abortWriter();
@@ -13640,7 +13656,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						unsafeHostExec: directWorkspace,
 						signal: controller.signal,
 						onAdmitted: (admission) => {
-							if (!managedLaunch) return;
 							if (admissionReserved) {
 								releaseManagedWriterAdmission();
 								admissionReserved = false;
@@ -13731,35 +13746,31 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						admissionReserved = false;
 					}
 				});
-				let result: WriterResult;
-				if (managedLaunch) {
-					const outcome = await Promise.race([
-						admitted.then((record) => ({ kind: "admitted" as const, record })),
-						completion.then((completed) => ({ kind: "completed" as const, result: completed })),
-					]);
-					if (outcome.kind === "admitted") {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Writer ${outcome.record.runId} accepted after clean parent/worktree preflight. It is still running in ${outcome.record.workspaceIsolation === "worktree" ? "an isolated worktree" : "the explicitly authorized parent workspace"}; inspect or stop it with manage_subagent. No patch is integrated automatically.`,
-								},
-							],
-							details: {
-								accepted: {
-									runId: outcome.record.runId,
-									resultRef: `writer:${outcome.record.runId}`,
-									baseCommit: outcome.record.baseCommit,
-									workspaceIsolation: outcome.record.workspaceIsolation,
-								},
+				// A writer that finishes before admission (preflight failure) returns its result directly.
+				const outcome = await Promise.race([
+					admitted.then((record) => ({ kind: "admitted" as const, record })),
+					completion.then((completed) => ({ kind: "completed" as const, result: completed })),
+				]);
+				if (outcome.kind === "admitted") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Writer ${outcome.record.runId} accepted after clean parent/worktree preflight. It is still running in ${outcome.record.workspaceIsolation === "worktree" ? "an isolated worktree" : "the explicitly authorized parent workspace"}; inspect or stop it with manage_subagent. No patch is integrated automatically.`,
 							},
-							isError: false,
-						};
-					}
-					result = outcome.result;
-				} else {
-					result = await completion;
+						],
+						details: {
+							accepted: {
+								runId: outcome.record.runId,
+								resultRef: `writer:${outcome.record.runId}`,
+								baseCommit: outcome.record.baseCommit,
+								workspaceIsolation: outcome.record.workspaceIsolation,
+							},
+						},
+						isError: false,
+					};
 				}
+				const result = outcome.result;
 				const safeResult = redactWriterResult(result);
 				const progress = publishWorkflowProgress(
 					observatory,
@@ -14290,7 +14301,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		name: "manage_subagent",
 		label: "manage_subagent",
 		description:
-			"Inspect, peek, wait, follow up, detach, stop, resume, or delete the same ICE child through one phase-aware owner-scoped lifecycle. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately. Wait blocks this tool call for at most waitMs until a terminal state; a wait expiry reports the current state and never changes child state. Detach retains the same live child under management so the parent can continue other work. Follow-up queues bounded untrusted task data through Ice steering, requires a stable requestId, and is rejected while a user has takeover control. Following up or detaching preserves run ID, model, profile, scope, tool authority, and output budget. Stop explicitly cancels a live child. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently, while managed terminal observations stay peekable.",
+			"Inspect, peek, wait, follow up, detach, stop, resume, or delete the same ICE child through one phase-aware owner-scoped lifecycle. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately. Wait blocks this tool call for at most waitMs until a terminal state; a wait expiry reports the current state and never changes child state. Detach retains the same live child under management so the parent can continue other work. Follow-up queues bounded untrusted task data through Ice steering, requires a stable requestId, and is rejected while a user has takeover control. Following up or detaching preserves run ID, model, profile, scope, and tool authority. Stop explicitly cancels a live child. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently, while managed terminal observations stay peekable.",
 		promptSnippet: "Inspect, wait, follow up, stop, or manage a subagent run",
 		parameters: manageSubagentParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("manage_subagent", args, theme, context),
@@ -14346,9 +14357,15 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							"The selected subagent is not a live retained run owned by this parent session.",
 						);
 					const observed = withCheckIn(observation, parentSessionId);
+					const verification = managedVerificationFor(parentSessionId, observed);
 					return {
-						content: [{ type: "text", text: formatManagedObservation(observed) }],
-						details: { action: "peek" as const, runId: params.runId, observation: observed },
+						content: [{ type: "text", text: formatManagedObservation(observed, verification) }],
+						details: {
+							action: "peek" as const,
+							runId: params.runId,
+							observation: observed,
+							...(verification ? { verification } : {}),
+						},
 						isError: false,
 					};
 				}
@@ -14360,9 +14377,15 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						_signal,
 					);
 					const observed = withCheckIn(observation, parentSessionId);
+					const verification = managedVerificationFor(parentSessionId, observed);
 					return {
-						content: [{ type: "text", text: formatManagedObservation(observed) }],
-						details: { action: "wait" as const, runId: params.runId, observation: observed },
+						content: [{ type: "text", text: formatManagedObservation(observed, verification) }],
+						details: {
+							action: "wait" as const,
+							runId: params.runId,
+							observation: observed,
+							...(verification ? { verification } : {}),
+						},
 						isError: false,
 					};
 				}
@@ -14535,10 +14558,10 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const delegate: DelegateTool = {
 		name: "delegate",
 		label: "delegate",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Run one foreground ICE child as a file agent or self-delegation (role self with bounded parent instructions; no file needed). Delegate returns a managed handle by default after the child starts; periodic check-ins are advisory and do not expire or interrupt the child. Use manage_subagent to inspect, follow up, wait, or stop. Set background: false only when the parent must synchronously wait for the final result. File agents resolve global-first; models follow the deterministic call/primary/fallback/parent order without credential expansion. Safe mode clamps the selected profile to its requested read-only capabilities. Explicit --sub-yolo permits only the selected profile's requested built-in capabilities that are also active in the trusted parent after build-mode, trust, and parent-Bash checks; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child tool allowlist and recursive delegation is not authorized. This is not a filesystem sandbox; the parent verifies and synthesizes the evidence.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Run one managed ICE child as a file agent or self-delegation (role self with bounded parent instructions; no file needed). Delegate always returns a managed handle after the child starts; periodic check-ins are advisory and do not expire or interrupt the child. Use manage_subagent to inspect, follow up, wait, or stop; read a large final answer with read_subagent_output when the result carries an output artifact. File agents resolve global-first; models follow the deterministic call/primary/fallback/parent order without credential expansion. Safe mode clamps the selected profile to its requested read-only capabilities. Explicit --sub-yolo permits only the selected profile's requested built-in capabilities that are also active in the trusted parent after build-mode, trust, and parent-Bash checks; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child tool allowlist and recursive delegation is not authorized. This is not a filesystem sandbox; the parent verifies and synthesizes the evidence.`,
 		promptSnippet: "Delegate one bounded file/self subagent",
 		promptGuidelines: [...SUBAGENT_DELEGATION_POLICY_GUIDELINES],
-		parameters: delegateForegroundParameters,
+		parameters: delegateParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("delegate", args, theme, context),
 		renderResult: (result, options, theme, context) => renderObservatoryResult(result, options, theme, context),
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
@@ -14685,13 +14708,11 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
 				const effectiveParentActiveTools = parentActiveTools;
-				const managedLaunch = params.background !== false;
 				let resolveManagedHandle: ((handle: SubagentManagedHandle) => void) | undefined;
-				const managedHandlePromise = managedLaunch
-					? new Promise<SubagentManagedHandle>((resolve) => {
-							resolveManagedHandle = resolve;
-						})
-					: undefined;
+				let managedHandleDelivered = false;
+				const managedHandlePromise = new Promise<SubagentManagedHandle>((resolve) => {
+					resolveManagedHandle = resolve;
+				});
 				const runChild = (
 					attempt: 1 | 2,
 					childRequest: NormalizedSubagentRequest,
@@ -14713,91 +14734,98 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						hookRuntime,
 						onEvent: (event) =>
 							publishRuntimeProgress(observatory, toolCallId, "delegate", ctx.cwd, event, onUpdate),
-						...(managedLaunch
-							? {
-									onManagedHandle: (handle: SubagentManagedHandle) => {
-										const coordinator = getCheckIns(normalized.parentSessionId);
-										if (!coordinator.getState(handle.runId))
-											coordinator.arm(handle.runId, childRequest.checkInIntervalMs, () => {
-												const attention = runner.getRuntimeAttention(
-													handle.runId,
-													normalized.parentSessionId,
-												);
-												return {
-													runId: handle.runId,
-													role: childRequest.role,
-													model: modelLabel(childRequest.retryModel ?? model) ?? "unknown",
-													executionStatus: "running" as const,
-													phase: attention?.phase,
-													currentTool: attention?.lastActivities.at(-1)?.toolName,
-													currentPath: attention?.lastActivities.at(-1)?.path,
-													terminal: attention?.state === "terminal",
-													lastProgressAt: attention?.lastProgressAtMs,
-													progressAgeMs: attention?.progressAgeMs,
-													recentActivities: attention?.lastActivities
-														.slice(-3)
-														.map(formatSubagentToolActivity),
-													freshness: subagentCheckInFreshness(
-														attention?.progressAgeMs,
-														childRequest.checkInIntervalMs,
-													),
-													isolation: unsafeHostExec ? ("host" as const) : ("read-only" as const),
-												};
-											});
-										resolveManagedHandle?.(handle);
-									},
-								}
-							: {}),
+						onManagedHandle: (handle: SubagentManagedHandle) => {
+							const coordinator = getCheckIns(normalized.parentSessionId);
+							if (!coordinator.getState(handle.runId))
+								coordinator.arm(handle.runId, childRequest.checkInIntervalMs, () => {
+									const attention = runner.getRuntimeAttention(handle.runId, normalized.parentSessionId);
+									return {
+										runId: handle.runId,
+										role: childRequest.role,
+										model: modelLabel(childRequest.retryModel ?? model) ?? "unknown",
+										executionStatus: "running" as const,
+										phase: attention?.phase,
+										currentTool: attention?.lastActivities.at(-1)?.toolName,
+										currentPath: attention?.lastActivities.at(-1)?.path,
+										terminal: attention?.state === "terminal",
+										lastProgressAt: attention?.lastProgressAtMs,
+										progressAgeMs: attention?.progressAgeMs,
+										recentActivities: attention?.lastActivities.slice(-3).map(formatSubagentToolActivity),
+										freshness: subagentCheckInFreshness(
+											attention?.progressAgeMs,
+											childRequest.checkInIntervalMs,
+										),
+										isolation: unsafeHostExec ? ("host" as const) : ("read-only" as const),
+									};
+								});
+							managedHandleDelivered = true;
+							rememberManagedRequest(childRequest);
+							resolveManagedHandle?.(handle);
+						},
 					});
 				const runPromise = unsafeHostExec
 					? runChild(1, normalized, effectiveParentActiveTools)
 					: runSubagentWithRecovery(normalized, effectiveParentActiveTools, runChild, {
 							getStopReason: () => (signal?.aborted ? "cancelled" : undefined),
 						});
-				if (managedLaunch) {
-					void runPromise.then(
-						() => terminalCheckIn(normalized.parentSessionId, normalized.runId),
-						() => terminalCheckIn(normalized.parentSessionId, normalized.runId),
-					);
-				}
-				let result: SubagentResult;
-				if (managedLaunch && managedHandlePromise) {
-					// Return control at admission: the same child session keeps running
-					// under the supervisor, and the run promise is kept alive so its
-					// terminal result is published exactly once to the retained ledger.
-					//
-					// The retained child stays bound to the parent run signal handed to
-					// runResolved, exactly like delegate_async's parent-run tie: a normal run
-					// completion never aborts that signal, so returning here does not cancel
-					// the child. It terminates only on an explicit abort/compact/dispose of the
-					// launching run, on manage_subagent stop, or on session shutdown through
-					// runner.shutdown().
-					const outcome = await Promise.race([
-						runPromise.then((value) => ({ kind: "settled" as const, value })),
-						managedHandlePromise.then((handle) => ({ kind: "managed" as const, handle })),
-					]);
-					if (outcome.kind === "managed") {
-						void runPromise.catch(() => {});
-						const observation = runner.peekRuntime(outcome.handle.runId, normalized.parentSessionId);
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Launched retained subagent ${outcome.handle.runId} in managed mode; it keeps the same run ID, child session, model, profile, scope, and tool authority.${observation ? `\n${formatManagedObservation(observation)}` : ""}`,
-								},
-							],
-							details: {
-								managed: outcome.handle,
-								...(observation ? { observation } : {}),
-								launch: createSubagentLaunchProvenance(normalized, model),
+				void runPromise.then(
+					(settled) => {
+						terminalCheckIn(normalized.parentSessionId, normalized.runId);
+						// A result that settles before the handle is returned directly below.
+						if (!managedHandleDelivered) return;
+						const request =
+							managedRequests.get(managedRequestKey(normalized.parentSessionId, settled.runId)) ?? normalized;
+						recordTelemetry(
+							settled.runId,
+							normalized.role,
+							"foreground",
+							settled,
+							verifySubagentResult(settled, request),
+							normalized.acceptanceCriteria.length,
+						);
+					},
+					() => terminalCheckIn(normalized.parentSessionId, normalized.runId),
+				);
+				// Return control at admission: the same child session keeps running
+				// under the supervisor, and the run promise is kept alive so its
+				// terminal result is published exactly once to the retained ledger.
+				//
+				// The retained child stays bound to the parent run signal handed to
+				// runResolved, exactly like delegate_async's parent-run tie: a normal run
+				// completion never aborts that signal, so returning here does not cancel
+				// the child. It terminates only on an explicit abort/compact/dispose of the
+				// launching run, on manage_subagent stop, or on session shutdown through
+				// runner.shutdown().
+				const outcome = await Promise.race([
+					runPromise.then((value) => ({ kind: "settled" as const, value })),
+					managedHandlePromise.then((handle) => ({ kind: "managed" as const, handle })),
+				]);
+				if (outcome.kind === "managed") {
+					void runPromise.catch(() => {});
+					const observation = runner.peekRuntime(outcome.handle.runId, normalized.parentSessionId);
+					// A startup fallback may have admitted a different model than the first candidate.
+					const admittedRequest =
+						managedRequests.get(managedRequestKey(normalized.parentSessionId, outcome.handle.runId)) ??
+						normalized;
+					const launchText = `Launched retained subagent ${outcome.handle.runId} in managed mode; it keeps the same run ID, child session, model, profile, scope, and tool authority.${observation ? `\n${formatManagedObservation(observation)}` : ""}`;
+					return {
+						content: [
+							{
+								type: "text",
+								text: breadthAdvisory ? `Advisory: ${breadthAdvisory}\n\n${launchText}` : launchText,
 							},
-							isError: false,
-						};
-					}
-					result = outcome.value;
-				} else {
-					result = await runPromise;
+						],
+						details: {
+							managed: outcome.handle,
+							...(observation ? { observation } : {}),
+							launch: createSubagentLaunchProvenance(admittedRequest, admittedRequest.retryModel ?? model),
+							...(breadthAdvisory ? { advisory: breadthAdvisory } : {}),
+						},
+						isError: false,
+					};
 				}
+				// Settled before the managed handle existed (startup failure or instant completion).
+				const result = outcome.value;
 				const verification = verifySubagentResult(result, normalized);
 				recordTelemetry(
 					result.runId,
@@ -14885,7 +14913,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const delegateAsync: DelegateAsyncTool = {
 		name: "delegate_async",
 		label: "delegate_async",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Accept one durable asynchronous ICE child for the current session using the current parent model captured at acceptance time. While it runs, ICE delivers periodic check-ins to the owning session using its configured interval; these are progress notices, not child deadlines, and cancellation remains explicit. The returned details.accepted.jobId is the bare identifier for inspect_subagent_job or cancel_subagent_job; details.accepted.resultRef (job:<id>) is display/reference metadata, not a jobId. Do not use a batchId, taskId, or foreground runId with the durable-job tools. The parent-owned scheduler admits bounded active work or FIFO queued work, reserves bounded output, owns cancellation, persists state, and returns acceptance metadata without awaiting the child. Safe mode clamps the selected profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child allowlist and recursive delegation is not authorized.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Accept one durable asynchronous ICE child for the current session using the current parent model captured at acceptance time. While it runs, ICE delivers periodic check-ins to the owning session using its configured interval; these are progress notices, not child deadlines, and cancellation remains explicit. The returned details.accepted.jobId is the bare identifier for inspect_subagent_job or cancel_subagent_job; details.accepted.resultRef (job:<id>) is display/reference metadata, not a jobId. Do not use a batchId, taskId, or foreground runId with the durable-job tools. The parent-owned scheduler admits bounded active work or FIFO queued work, owns cancellation, persists state, and returns acceptance metadata without awaiting the child. Safe mode clamps the selected profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child allowlist and recursive delegation is not authorized.`,
 		promptSnippet: "Launch one durable asynchronous subagent",
 		promptGuidelines: [...SUBAGENT_DELEGATION_POLICY_GUIDELINES],
 		parameters: delegateAsyncParameters,
@@ -15415,7 +15443,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const delegateBatch: DelegateBatchTool = {
 		name: "delegate_batch",
 		label: "delegate_batch",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never wrap a single task in a batch: delegate_batch is for two or more independent sibling tasks, so a lone task is done directly in the parent. Run up to eight independently scoped sibling ICE children through the same atomic executor using the current parent model. Each child uses a fresh session and a parent-owned bounded complete-report output budget. By default, the tool returns an owner-scoped batchId and child runIds after preflight so the parent remains available; inspect with inspect_subagent_batch, cancel the aggregate with cancel_subagent_batch, or manage an individual child by its runId. Set background:false only when synchronous aggregation is required. batchId/resultRef are not durable jobIds. Safe mode clamps each selected profile to requested read-only capabilities. Explicit --sub-yolo permits only each profile's requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains each explicit child allowlist and recursive delegation is not authorized. The parent synthesizes the independent evidence.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never wrap a single task in a batch: delegate_batch is for two or more independent sibling tasks, so a lone task is done directly in the parent. Run up to eight independently scoped sibling ICE children through the same atomic executor using the current parent model. Each child uses a fresh session; its final answer is retained with fixed host-owned inline limits plus an optional output artifact. The tool always returns an owner-scoped batchId and child runIds after preflight so the parent remains available; inspect with inspect_subagent_batch, cancel the aggregate with cancel_subagent_batch, manage an individual child by its runId, or read a child output artifact with read_subagent_output. batchId/resultRef are not durable jobIds. Safe mode clamps each selected profile to requested read-only capabilities. Explicit --sub-yolo permits only each profile's requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains each explicit child allowlist and recursive delegation is not authorized. The parent synthesizes the independent evidence.`,
 		promptSnippet: "Delegate bounded parallel profile-aware subagents",
 		promptGuidelines: [
 			...SUBAGENT_DELEGATION_POLICY_GUIDELINES,
@@ -15526,232 +15554,160 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				const effectiveParentActiveTools = unsafeAuthorization
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
-				if (params.background !== false) {
-					if (signal?.aborted) throw new SubagentError("cancellation", "Batch was cancelled before admission.");
-					const batchId = randomUUID();
-					const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
-					const backgroundOptions = {
-						batchId,
-						concurrency: params.concurrency,
-						concurrencyPolicy,
-						admission: subagentAdmission,
-						failFast: params.failFast,
-						modelRuntime: ctx.modelRegistry.getRuntime(),
-						settingsManager,
-						unsafeHostExec,
-						isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
-							isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					};
-					buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
-					const batchController = new AbortController();
-					const abortBatch = (): void => batchController.abort();
-					if (signal) signal.addEventListener("abort", abortBatch, { once: true });
-					const record = createManagedBatch(
-						batchId,
-						ctx.sessionManager.getSessionId(),
-						"batch",
-						batchController,
-						tasks,
-					);
-					const completion = runResolvedSubagentBatch(tasks, effectiveParentActiveTools, runner, {
-						...backgroundOptions,
-						managedBackground: true,
-						signal: batchController.signal,
-						onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
-						onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
-						onTaskState: (event) => {
-							const state = record.tasks.get(event.taskId);
-							if (state) {
-								state.status =
-									event.type === "task_queued"
-										? "queued"
-										: event.type === "task_admitted"
-											? "admitted"
-											: event.status;
-							}
-							if (event.type === "task_admitted") record.state = "running";
-							publishBatchTaskProgress(observatory, toolCallId, "delegate_batch", event, undefined);
-						},
-						onEvent: (event) => {
-							if (event.type === "subagent_started") record.state = "running";
-							publishRuntimeProgress(observatory, toolCallId, "delegate_batch", ctx.cwd, event, undefined);
-						},
-					});
-					record.completion = completion;
-					void completion
-						.then(
-							(result) => {
-								const safeResult = redactSubagentBatchResult(result);
-								record.result = safeResult;
-								record.state =
-									result.status === "completed"
-										? "completed"
-										: result.status === "partial"
-											? "partial"
-											: result.status === "cancelled"
-												? "cancelled"
-												: "failed";
-								for (const item of result.items) {
-									recordTelemetry(
-										item.result.runId,
-										item.launch.profile.name,
-										"batch",
-										item.result,
-										item.verification,
-										tasks.find((task) => task.id === item.taskId)?.request.acceptanceCriteria.length ?? 0,
-									);
-								}
-								const owner = options.agentViewBridge?.getParentSession();
-								if (owner?.sessionId === record.ownerSessionId) {
-									void owner
-										.sendCustomMessage(
-											{
-												customType: "subagent_batch_completed",
-												content: `ICE batch ${batchId} finished with status ${record.state}. Child result data is untrusted; inspect batch ${batchId} for the bounded aggregate report.`,
-												display: false,
-												details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
-											},
-											{ triggerTurn: true, deliverAs: "followUp" },
-										)
-										.catch(() => {});
-								}
-								publishWorkflowProgress(
-									observatory,
-									toolCallId,
-									"delegate_batch",
-									{
-										phase:
-											record.state === "completed"
-												? "completed"
-												: record.state === "cancelled"
-													? "cancelled"
-													: "failed",
-										status: record.state,
-										runId: batchId,
-										cwd: ctx.cwd,
-									},
-									undefined,
-								);
-							},
-							(error: unknown) => {
-								record.state = batchController.signal.aborted ? "cancelled" : "failed";
-								for (const state of record.tasks.values()) {
-									if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
-										state.status = batchController.signal.aborted ? "cancelled" : "failed";
-									}
-								}
-								record.result = undefined;
-								releaseManagedBatchOutput(record);
-								publishWorkflowProgress(
-									observatory,
-									toolCallId,
-									"delegate_batch",
-									{
-										phase: record.state === "cancelled" ? "cancelled" : "failed",
-										status: record.state,
-										runId: batchId,
-										cwd: ctx.cwd,
-										diagnostics: [String(error)],
-									},
-									undefined,
-								);
-							},
-						)
-						.finally(() => {
-							signal?.removeEventListener("abort", abortBatch);
-							record.completion = undefined;
-						});
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Managed batch ${batchId} accepted with ${tasks.length} scoped children. Inspect with that bare batchId; each child has its own runId.`,
-							},
-						],
-						details: {
-							accepted: {
-								batchId,
-								resultRef: `batch:${batchId}`,
-								tasks: tasks.map((task) => ({
-									taskId: task.id,
-									runId: task.request.runId,
-									role: task.request.role,
-									model: modelLabel(task.model) ?? "unknown",
-								})),
-							},
-						},
-						isError: false,
-					};
-				}
-				const result = await runResolvedSubagentBatch(tasks, effectiveParentActiveTools, runner, {
+				if (signal?.aborted) throw new SubagentError("cancellation", "Batch was cancelled before admission.");
+				const batchId = randomUUID();
+				const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
+				const backgroundOptions = {
+					batchId,
 					concurrency: params.concurrency,
-					concurrencyPolicy: resolveSubagentConcurrencyPolicyFromSettings(settingsManager),
+					concurrencyPolicy,
 					admission: subagentAdmission,
 					failFast: params.failFast,
 					modelRuntime: ctx.modelRegistry.getRuntime(),
 					settingsManager,
 					unsafeHostExec,
-					signal,
-					isAuthorityStillValid: (request, hookRuntime) =>
+					isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
 						isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					onTaskState: (event) =>
-						publishBatchTaskProgress(observatory, toolCallId, "delegate_batch", event, onUpdate),
-					onEvent: (event) =>
-						publishRuntimeProgress(observatory, toolCallId, "delegate_batch", ctx.cwd, event, onUpdate),
-				});
-				for (const item of result.items) {
-					recordTelemetry(
-						item.result.runId,
-						item.launch.profile.name,
-						"batch",
-						item.result,
-						item.verification,
-						tasks.find((task) => task.id === item.taskId)?.request.acceptanceCriteria.length ?? 0,
-					);
-					publishWorkflowProgress(
-						observatory,
-						`${toolCallId}/${item.taskId}`,
-						"delegate_batch",
-						{
-							phase: terminalProgressPhase(item.result.status),
-							status: item.result.status,
-							runId: item.result.runId,
-							taskId: item.taskId,
-							model: item.launch.model,
-							cwd: ctx.cwd,
-							evidenceCount: item.result.evidence?.paths.length,
-							usage: item.result.usage,
-							diagnostics: item.result.diagnostics.map((diagnostic) => diagnostic.code),
-						},
-						onUpdate,
-					);
-				}
-				const progress = publishWorkflowProgress(
-					observatory,
-					toolCallId,
-					"delegate_batch",
-					{
-						phase:
-							result.status === "completed"
-								? "completed"
-								: result.status === "cancelled"
-									? "cancelled"
-									: result.status === "timed_out"
-										? "timed_out"
-										: "failed",
-						status: result.status,
-						runId: result.batchId,
-						cwd: ctx.cwd,
-						usage: result.usage,
-						diagnostics: result.diagnostics.map((diagnostic) => diagnostic.code),
-					},
-					onUpdate,
+				};
+				buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
+				const batchController = new AbortController();
+				const abortBatch = (): void => batchController.abort();
+				if (signal) signal.addEventListener("abort", abortBatch, { once: true });
+				const record = createManagedBatch(
+					batchId,
+					ctx.sessionManager.getSessionId(),
+					"batch",
+					batchController,
+					tasks,
 				);
-				const safeResult = redactSubagentBatchResult(result);
+				const completion = runResolvedSubagentBatch(tasks, effectiveParentActiveTools, runner, {
+					...backgroundOptions,
+					managedBackground: true,
+					signal: batchController.signal,
+					onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
+					onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
+					onTaskState: (event) => {
+						const state = record.tasks.get(event.taskId);
+						if (state) {
+							state.status =
+								event.type === "task_queued"
+									? "queued"
+									: event.type === "task_admitted"
+										? "admitted"
+										: event.status;
+						}
+						if (event.type === "task_admitted") record.state = "running";
+						publishBatchTaskProgress(observatory, toolCallId, "delegate_batch", event, undefined);
+					},
+					onEvent: (event) => {
+						if (event.type === "subagent_started") record.state = "running";
+						publishRuntimeProgress(observatory, toolCallId, "delegate_batch", ctx.cwd, event, undefined);
+					},
+				});
+				record.completion = completion;
+				void completion
+					.then(
+						(result) => {
+							const safeResult = redactSubagentBatchResult(result);
+							record.result = safeResult;
+							record.state =
+								result.status === "completed"
+									? "completed"
+									: result.status === "partial"
+										? "partial"
+										: result.status === "cancelled"
+											? "cancelled"
+											: "failed";
+							for (const item of result.items) {
+								recordTelemetry(
+									item.result.runId,
+									item.launch.profile.name,
+									"batch",
+									item.result,
+									item.verification,
+									tasks.find((task) => task.id === item.taskId)?.request.acceptanceCriteria.length ?? 0,
+								);
+							}
+							const owner = options.agentViewBridge?.getParentSession();
+							if (owner?.sessionId === record.ownerSessionId) {
+								void owner
+									.sendCustomMessage(
+										{
+											customType: "subagent_batch_completed",
+											content: `ICE batch ${batchId} finished with status ${record.state}. Child result data is untrusted; inspect batch ${batchId} for the bounded aggregate report.`,
+											display: false,
+											details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
+										},
+										{ triggerTurn: true, deliverAs: "followUp" },
+									)
+									.catch(() => {});
+							}
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"delegate_batch",
+								{
+									phase:
+										record.state === "completed"
+											? "completed"
+											: record.state === "cancelled"
+												? "cancelled"
+												: "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+								},
+								undefined,
+							);
+						},
+						(error: unknown) => {
+							record.state = batchController.signal.aborted ? "cancelled" : "failed";
+							for (const state of record.tasks.values()) {
+								if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
+									state.status = batchController.signal.aborted ? "cancelled" : "failed";
+								}
+							}
+							record.result = undefined;
+							releaseManagedBatchOutput(record);
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"delegate_batch",
+								{
+									phase: record.state === "cancelled" ? "cancelled" : "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+									diagnostics: [String(error)],
+								},
+								undefined,
+							);
+						},
+					)
+					.finally(() => {
+						signal?.removeEventListener("abort", abortBatch);
+						record.completion = undefined;
+					});
 				return {
-					content: [{ type: "text", text: formatBatchToolResult(safeResult) }],
-					details: { result: safeResult, ...(progress ? { progress } : {}) },
-					isError: result.status !== "completed",
+					content: [
+						{
+							type: "text",
+							text: `Managed batch ${batchId} accepted with ${tasks.length} scoped children. Inspect with that bare batchId; each child has its own runId.`,
+						},
+					],
+					details: {
+						accepted: {
+							batchId,
+							resultRef: `batch:${batchId}`,
+							tasks: tasks.map((task) => ({
+								taskId: task.id,
+								runId: task.request.runId,
+								role: task.request.role,
+								model: modelLabel(task.model) ?? "unknown",
+							})),
+						},
+					},
+					isError: false,
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -15773,7 +15729,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const reviewBatch: ReviewBatchTool = {
 		name: "review_batch",
 		label: "review_batch",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never run a single-reviewer batch: review_batch is for two or more independent review dimensions or targets, so one review is done directly in the parent. Run up to eight independently scoped reviewers for correctness, security, tests, or regression risk through the existing bounded delegate scheduler. Reviewers always use the current parent model and preserve independent verification. By default, return an owner-scoped batchId and child runIds after preflight; inspect the deterministic aggregate with inspect_subagent_batch, cancel with cancel_subagent_batch, or manage each child by its runId. Set background:false only when synchronous aggregation is required. batchId/resultRef are not durable jobIds. Safe mode clamps the resolved review profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains the explicit reviewer allowlist and recursive delegation is not authorized.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never run a single-reviewer batch: review_batch is for two or more independent review dimensions or targets, so one review is done directly in the parent. Run up to eight independently scoped reviewers for correctness, security, tests, or regression risk through the existing bounded delegate scheduler. Reviewers always use the current parent model and preserve independent verification. Always returns an owner-scoped batchId and child runIds after preflight; inspect the deterministic aggregate with inspect_subagent_batch, cancel with cancel_subagent_batch, or manage each child by its runId. batchId/resultRef are not durable jobIds. Safe mode clamps the resolved review profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains the explicit reviewer allowlist and recursive delegation is not authorized.`,
 		promptSnippet: "Run bounded parallel typed reviewers",
 		promptGuidelines: [
 			...SUBAGENT_DELEGATION_POLICY_GUIDELINES,
@@ -15865,231 +15821,161 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				const effectiveParentActiveTools = unsafeAuthorization
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
-				if (params.background !== false) {
-					if (signal?.aborted)
-						throw new SubagentError("cancellation", "Review batch was cancelled before admission.");
-					const batchId = randomUUID();
-					const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
-					const backgroundOptions = {
-						batchId,
-						concurrency: params.concurrency,
-						concurrencyPolicy,
-						admission: subagentAdmission,
-						failFast: params.failFast,
-						modelRuntime: ctx.modelRegistry.getRuntime(),
-						settingsManager,
-						unsafeHostExec,
-						isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
-							isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					};
-					buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
-					const batchController = new AbortController();
-					const abortBatch = (): void => batchController.abort();
-					if (signal) signal.addEventListener("abort", abortBatch, { once: true });
-					const record = createManagedBatch(
-						batchId,
-						ctx.sessionManager.getSessionId(),
-						"review",
-						batchController,
-						tasks,
-					);
-					const completion = runResolvedReviewBatch(tasks, effectiveParentActiveTools, runner, {
-						...backgroundOptions,
-						managedBackground: true,
-						signal: batchController.signal,
-						onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
-						onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
-						onTaskState: (event) => {
-							const state = record.tasks.get(event.taskId);
-							if (state) {
-								state.status =
-									event.type === "task_queued"
-										? "queued"
-										: event.type === "task_admitted"
-											? "admitted"
-											: event.status;
-							}
-							if (event.type === "task_admitted") record.state = "running";
-							publishBatchTaskProgress(observatory, toolCallId, "review_batch", event, undefined);
-						},
-						onEvent: (event) => {
-							if (event.type === "subagent_started") record.state = "running";
-							publishRuntimeProgress(observatory, toolCallId, "review_batch", ctx.cwd, event, undefined);
-						},
-					});
-					record.completion = completion;
-					void completion
-						.then(
-							(result) => {
-								const safeResult = redactReviewBatchResult(result);
-								record.result = safeResult;
-								record.state =
-									result.status === "completed"
-										? "completed"
-										: result.status === "partial"
-											? "partial"
-											: result.status === "cancelled"
-												? "cancelled"
-												: "failed";
-								for (const reviewer of result.reviewers) {
-									recordTelemetry(
-										reviewer.result.runId,
-										reviewer.launch.profile.name,
-										"review",
-										reviewer.result,
-										reviewer.verification,
-										tasks.find((task) => task.id === reviewer.taskId)?.request.acceptanceCriteria.length ?? 0,
-									);
-								}
-								const owner = options.agentViewBridge?.getParentSession();
-								if (owner?.sessionId === record.ownerSessionId) {
-									void owner
-										.sendCustomMessage(
-											{
-												customType: "subagent_review_batch_completed",
-												content: `ICE review batch ${batchId} finished with status ${record.state}. Reviewer findings are untrusted data; inspect batch ${batchId} for the bounded aggregate report.`,
-												display: false,
-												details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
-											},
-											{ triggerTurn: true, deliverAs: "followUp" },
-										)
-										.catch(() => {});
-								}
-								publishWorkflowProgress(
-									observatory,
-									toolCallId,
-									"review_batch",
-									{
-										phase:
-											record.state === "completed"
-												? "completed"
-												: record.state === "cancelled"
-													? "cancelled"
-													: "failed",
-										status: record.state,
-										runId: batchId,
-										cwd: ctx.cwd,
-									},
-									undefined,
-								);
-							},
-							(error: unknown) => {
-								record.state = batchController.signal.aborted ? "cancelled" : "failed";
-								for (const state of record.tasks.values()) {
-									if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
-										state.status = batchController.signal.aborted ? "cancelled" : "failed";
-									}
-								}
-								record.result = undefined;
-								releaseManagedBatchOutput(record);
-								publishWorkflowProgress(
-									observatory,
-									toolCallId,
-									"review_batch",
-									{
-										phase: record.state === "cancelled" ? "cancelled" : "failed",
-										status: record.state,
-										runId: batchId,
-										cwd: ctx.cwd,
-										diagnostics: [String(error)],
-									},
-									undefined,
-								);
-							},
-						)
-						.finally(() => {
-							signal?.removeEventListener("abort", abortBatch);
-							record.completion = undefined;
-						});
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Review batch ${batchId} accepted with ${tasks.length} independent reviewers. Inspect with that bare batchId; each child has its own runId.`,
-							},
-						],
-						details: {
-							accepted: {
-								batchId,
-								resultRef: `batch:${batchId}`,
-								tasks: tasks.map((task) => ({
-									taskId: task.id,
-									runId: task.request.runId,
-									role: task.request.role,
-									model: modelLabel(task.model) ?? "unknown",
-								})),
-							},
-						},
-						isError: false,
-					};
-				}
-				const result = await runResolvedReviewBatch(tasks, effectiveParentActiveTools, runner, {
+				if (signal?.aborted)
+					throw new SubagentError("cancellation", "Review batch was cancelled before admission.");
+				const batchId = randomUUID();
+				const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
+				const backgroundOptions = {
+					batchId,
 					concurrency: params.concurrency,
+					concurrencyPolicy,
+					admission: subagentAdmission,
 					failFast: params.failFast,
 					modelRuntime: ctx.modelRegistry.getRuntime(),
 					settingsManager,
 					unsafeHostExec,
-					signal,
-					isAuthorityStillValid: (request, hookRuntime) =>
+					isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
 						isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					onTaskState: (event) =>
-						publishBatchTaskProgress(observatory, toolCallId, "review_batch", event, onUpdate),
-					onEvent: (event) =>
-						publishRuntimeProgress(observatory, toolCallId, "review_batch", ctx.cwd, event, onUpdate),
-				});
-				for (const reviewer of result.reviewers) {
-					recordTelemetry(
-						reviewer.result.runId,
-						reviewer.launch.profile.name,
-						"review",
-						reviewer.result,
-						reviewer.verification,
-						0,
-					);
-					publishWorkflowProgress(
-						observatory,
-						`${toolCallId}/${reviewer.taskId}`,
-						"review_batch",
-						{
-							phase: terminalProgressPhase(reviewer.result.status),
-							status: reviewer.result.status,
-							runId: reviewer.result.runId,
-							taskId: reviewer.taskId,
-							model: reviewer.launch.model,
-							cwd: ctx.cwd,
-							evidenceCount: reviewer.result.evidence?.paths.length,
-							usage: reviewer.result.usage,
-							diagnostics: reviewer.result.diagnostics.map((diagnostic) => diagnostic.code),
-						},
-						onUpdate,
-					);
-				}
-				const progress = publishWorkflowProgress(
-					observatory,
-					toolCallId,
-					"review_batch",
-					{
-						phase:
-							result.status === "completed"
-								? "completed"
-								: result.status === "cancelled"
-									? "cancelled"
-									: result.status === "timed_out"
-										? "timed_out"
-										: "failed",
-						status: result.status,
-						runId: result.batchId,
-						cwd: ctx.cwd,
-						usage: result.usage,
-						diagnostics: result.diagnostics.map((diagnostic) => diagnostic.code),
-					},
-					onUpdate,
+				};
+				buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
+				const batchController = new AbortController();
+				const abortBatch = (): void => batchController.abort();
+				if (signal) signal.addEventListener("abort", abortBatch, { once: true });
+				const record = createManagedBatch(
+					batchId,
+					ctx.sessionManager.getSessionId(),
+					"review",
+					batchController,
+					tasks,
 				);
-				const safeResult = redactReviewBatchResult(result);
+				const completion = runResolvedReviewBatch(tasks, effectiveParentActiveTools, runner, {
+					...backgroundOptions,
+					managedBackground: true,
+					signal: batchController.signal,
+					onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
+					onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
+					onTaskState: (event) => {
+						const state = record.tasks.get(event.taskId);
+						if (state) {
+							state.status =
+								event.type === "task_queued"
+									? "queued"
+									: event.type === "task_admitted"
+										? "admitted"
+										: event.status;
+						}
+						if (event.type === "task_admitted") record.state = "running";
+						publishBatchTaskProgress(observatory, toolCallId, "review_batch", event, undefined);
+					},
+					onEvent: (event) => {
+						if (event.type === "subagent_started") record.state = "running";
+						publishRuntimeProgress(observatory, toolCallId, "review_batch", ctx.cwd, event, undefined);
+					},
+				});
+				record.completion = completion;
+				void completion
+					.then(
+						(result) => {
+							const safeResult = redactReviewBatchResult(result);
+							record.result = safeResult;
+							record.state =
+								result.status === "completed"
+									? "completed"
+									: result.status === "partial"
+										? "partial"
+										: result.status === "cancelled"
+											? "cancelled"
+											: "failed";
+							for (const reviewer of result.reviewers) {
+								recordTelemetry(
+									reviewer.result.runId,
+									reviewer.launch.profile.name,
+									"review",
+									reviewer.result,
+									reviewer.verification,
+									tasks.find((task) => task.id === reviewer.taskId)?.request.acceptanceCriteria.length ?? 0,
+								);
+							}
+							const owner = options.agentViewBridge?.getParentSession();
+							if (owner?.sessionId === record.ownerSessionId) {
+								void owner
+									.sendCustomMessage(
+										{
+											customType: "subagent_review_batch_completed",
+											content: `ICE review batch ${batchId} finished with status ${record.state}. Reviewer findings are untrusted data; inspect batch ${batchId} for the bounded aggregate report.`,
+											display: false,
+											details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
+										},
+										{ triggerTurn: true, deliverAs: "followUp" },
+									)
+									.catch(() => {});
+							}
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"review_batch",
+								{
+									phase:
+										record.state === "completed"
+											? "completed"
+											: record.state === "cancelled"
+												? "cancelled"
+												: "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+								},
+								undefined,
+							);
+						},
+						(error: unknown) => {
+							record.state = batchController.signal.aborted ? "cancelled" : "failed";
+							for (const state of record.tasks.values()) {
+								if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
+									state.status = batchController.signal.aborted ? "cancelled" : "failed";
+								}
+							}
+							record.result = undefined;
+							releaseManagedBatchOutput(record);
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"review_batch",
+								{
+									phase: record.state === "cancelled" ? "cancelled" : "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+									diagnostics: [String(error)],
+								},
+								undefined,
+							);
+						},
+					)
+					.finally(() => {
+						signal?.removeEventListener("abort", abortBatch);
+						record.completion = undefined;
+					});
 				return {
-					content: [{ type: "text", text: formatReviewBatchToolResult(safeResult) }],
-					details: { result: safeResult, ...(progress ? { progress } : {}) },
-					isError: result.status !== "completed",
+					content: [
+						{
+							type: "text",
+							text: `Review batch ${batchId} accepted with ${tasks.length} independent reviewers. Inspect with that bare batchId; each child has its own runId.`,
+						},
+					],
+					details: {
+						accepted: {
+							batchId,
+							resultRef: `batch:${batchId}`,
+							tasks: tasks.map((task) => ({
+								taskId: task.id,
+								runId: task.request.runId,
+								role: task.request.role,
+								model: modelLabel(task.model) ?? "unknown",
+							})),
+						},
+					},
+					isError: false,
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);

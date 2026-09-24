@@ -105,6 +105,19 @@ async function harness() {
 			content: Array<{ text: string }>;
 			details: Record<string, any>;
 		}>;
+	// Delegate always returns a managed handle; wait for the terminal result and merge it into the launch result.
+	const delegateSettled = async (params: Record<string, unknown>) => {
+		const launch = await call("delegate", params);
+		const runId = launch.details?.managed?.runId as string | undefined;
+		if (!runId) return launch;
+		const waited = await call("manage_subagent", { action: "wait", runId, waitMs: 60_000 });
+		const result = waited.details?.observation?.result;
+		return {
+			isError: waited.isError || result?.status !== "completed",
+			content: waited.content,
+			details: { ...launch.details, ...waited.details, result },
+		};
+	};
 	const request = { role: "self", task: "Inspect the source", scope: { roots: ["src"] } };
 	const file = (name: string, frontmatter: string) =>
 		writeFileSync(
@@ -125,6 +138,7 @@ async function harness() {
 		entries,
 		tools,
 		call,
+		delegateSettled,
 		request,
 		file,
 		setActive: (next: string[]) => {
@@ -159,9 +173,8 @@ describe("production file/self delegation acceptance", () => {
 				return fauxAssistantMessage(success);
 			},
 		]);
-		const result = await h.call("delegate", {
+		const result = await h.delegateSettled({
 			...h.request,
-			background: false,
 			self: { instructions: "ADDITIONAL_TASK_GUIDANCE" },
 		});
 		expect(result.isError).toBe(false);
@@ -187,9 +200,8 @@ describe("production file/self delegation acceptance", () => {
 			fauxAssistantMessage([fauxToolCall(subagentMcpToolName("docs/search"), { q: "query" })]),
 			fauxAssistantMessage(success),
 		]);
-		const result = await h.call("delegate", {
+		const result = await h.delegateSettled({
 			...h.request,
-			background: false,
 			self: { mcp: ["docs/search"] },
 		});
 		expect(result.isError).toBe(false);
@@ -221,9 +233,8 @@ describe("production file/self delegation acceptance", () => {
 			fauxAssistantMessage([fauxToolCall(subagentMcpToolName("docs/search"), { q: "query" })]),
 			fauxAssistantMessage(success),
 		]);
-		await h.call("delegate", {
+		await h.delegateSettled({
 			...h.request,
-			background: false,
 			self: { mcp: ["docs/search"] },
 			execution: { hooks: [] },
 		});
@@ -263,7 +274,7 @@ describe("production file/self delegation acceptance", () => {
 			}),
 		);
 		h.faux.setResponses([fauxAssistantMessage([fauxToolCall("lookup", {})]), fauxAssistantMessage(success)]);
-		expect((await h.call("delegate", { ...h.request, background: false })).isError).toBe(false);
+		expect((await h.delegateSettled(h.request)).isError).toBe(false);
 		expect(execute).toHaveBeenCalledOnce();
 		h.setActive(["delegate", "read"]);
 		expect((await h.call("delegate", { ...h.request, self: { capabilities: ["lookup"] } })).isError).toBe(true);
@@ -294,7 +305,7 @@ describe("production file/self delegation acceptance", () => {
 			if (selected.length === 1) return startupFailure(request);
 			return original.call(this, request, tools, options);
 		});
-		const result = await h.call("delegate", { ...h.request, role: "pair", background: false });
+		const result = await h.delegateSettled({ ...h.request, role: "pair" });
 		expect(selected).toEqual(["primary", "fallback"]);
 		expect(result.isError).toBe(false);
 		expect(result.details.launch.model).toContain("fallback");
