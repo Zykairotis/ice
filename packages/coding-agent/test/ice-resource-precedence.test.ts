@@ -106,9 +106,11 @@ describe("ice-only resource precedence and no ambient child installs", () => {
 			role: "self",
 			projectTrusted: true,
 			globalSettings: {
-				ice: { subagents: { defaults: { timeoutMs: 10_000 }, restrictions: { maxTimeoutMs: 8_000 } } },
+				ice: {
+					subagents: { defaults: { startupTimeoutMs: 10_000 }, restrictions: { maxStartupTimeoutMs: 8_000 } },
+				},
 			},
-			projectSettings: { ice: { subagents: { roleDefaults: { self: { timeoutMs: 4_000 } } } } },
+			projectSettings: { ice: { subagents: { roleDefaults: { self: { startupTimeoutMs: 4_000 } } } } },
 		});
 		expect(contract.values.timeoutMs).toBe(8_000);
 	});

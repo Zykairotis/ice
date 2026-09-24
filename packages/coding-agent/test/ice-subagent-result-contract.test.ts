@@ -311,7 +311,7 @@ describe("result contract: malformed reports preserve work artifacts", () => {
 		expect(result.evidence).toEqual({ paths: ["src/app.ts"] });
 	});
 
-	it("caps the complete serialized parent-facing envelope, not only report text", async () => {
+	it("enforces the structured-report parser bound independently of output retention", async () => {
 		const cwd = await workspace();
 		const response = JSON.stringify({
 			summary: "large findings",
@@ -323,17 +323,18 @@ describe("result contract: malformed reports preserve work artifacts", () => {
 				evidence: [{ path: "src/app.ts" }],
 			})),
 		});
-		const maxBytes = Buffer.byteLength(response);
 		const child = fakeChildSession({ firstResponse: response });
-		const normalized = normalizeSubagentRequest(request(cwd, { execution: { maxOutputBytes: maxBytes } }), cwd);
+		const normalized = normalizeSubagentRequest(request(cwd), cwd);
 		const result = await new NativeSubagentRunner({
 			createSession: async () => ({ session: child.session }) as CreateAgentSessionResult,
 		}).runResolved(normalized, ["delegate", "read"]);
 		expect(result.status).toBe("verification_failed");
 		expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain("report_protocol_failure");
-		expect(result.diagnostics.map((diagnostic) => diagnostic.message).join(" ")).toMatch(
-			/parent-facing result envelope/i,
-		);
+		expect(result.diagnostics.map((diagnostic) => diagnostic.message).join(" ")).toMatch(/bounded report size/i);
+		expect(result.output).toMatchObject({
+			captureStatus: "artifact_complete",
+			originalBytes: Buffer.byteLength(response),
+		});
 	});
 
 	it("rejects removed per-child turn and tool-call limits", async () => {
@@ -485,7 +486,14 @@ describe("requirement-level verification", () => {
 			source: normalized.profile.source,
 			status: "completed",
 			summary: "done",
-			observedOutputBytes: 32,
+			output: {
+				text: "done",
+				textBytes: 4,
+				originalBytes: 4,
+				inlineTruncated: false,
+				captureStatus: "inline_complete",
+			},
+			observedOutputBytes: 4,
 			partial: false,
 			diagnostics: [],
 			evidence: { paths: ["src/app.ts"] },

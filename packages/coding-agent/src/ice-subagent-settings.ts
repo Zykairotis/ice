@@ -26,8 +26,8 @@ import { redactCredentialText } from "./utils/redact.ts";
 /** Operational preference fields shared by defaults, role defaults, and calls. */
 export interface IceSubagentPreferenceFields {
 	thinking?: SubagentThinkingLevel;
-	timeoutMs?: number;
-	maxOutputBytes?: number;
+	checkInIntervalMs?: number;
+	startupTimeoutMs?: number;
 	temperature?: number;
 	topP?: number;
 }
@@ -39,8 +39,7 @@ export interface IceSubagentSettingsInput {
 	roleDefaults?: Record<string, IceSubagentPreferenceFields>;
 	/** Reserved enforcement namespace; unknown keys fail closed. */
 	restrictions?: {
-		maxTimeoutMs?: number;
-		maxOutputBytes?: number;
+		maxStartupTimeoutMs?: number;
 		denyRoles?: string[];
 		denyTools?: string[];
 	};
@@ -73,10 +72,9 @@ export interface IceSettingsInput {
 
 export const ICE_SUBAGENT_SETTINGS_LIMITS = {
 	maxThinkingLength: 16,
-	minTimeoutMs: 1,
-	maxTimeoutMs: 10 * 60 * 1_000,
-	minOutputBytes: 1_024,
-	maxOutputBytes: 64 * 1_024,
+	minCheckInIntervalMs: 120_000,
+	minStartupTimeoutMs: 1,
+	maxStartupTimeoutMs: 10 * 60 * 1_000,
 	minTemperature: 0,
 	maxTemperature: 2,
 	minTopP: 0,
@@ -111,8 +109,8 @@ const KNOWN_SUBAGENT_SETTINGS_KEYS = new Set([
 	"concurrency",
 ]);
 const KNOWN_CONCURRENCY_KEYS = new Set(["default", "max"]);
-const KNOWN_PREFERENCE_KEYS = new Set(["thinking", "timeoutMs", "maxOutputBytes", "temperature", "topP"]);
-const KNOWN_RESTRICTION_KEYS = new Set(["maxTimeoutMs", "maxOutputBytes", "denyRoles", "denyTools"]);
+const KNOWN_PREFERENCE_KEYS = new Set(["thinking", "checkInIntervalMs", "startupTimeoutMs", "temperature", "topP"]);
+const KNOWN_RESTRICTION_KEYS = new Set(["maxStartupTimeoutMs", "denyRoles", "denyTools"]);
 const KNOWN_HOOK_KEYS = new Set(["id", "event", "roles", "kind", "timeoutMs", "maxOutputBytes", "required"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -155,11 +153,17 @@ function parsePreferenceFields(
 	const diagnostics: string[] = [];
 	const fields: IceSubagentPreferenceFields = {};
 	for (const key of Object.keys(value)) {
+		if (key === "maxOutputBytes") {
+			throw fail(`${path}.${key}`, "removed; final-answer retention is controlled by fixed host limits");
+		}
 		if (key === "maxTotalTokens") {
-			throw fail(`${path}.${key}`, '"maxTotalTokens" was removed; use timeoutMs/maxOutputBytes');
+			throw fail(
+				`${path}.${key}`,
+				'"maxTotalTokens" was removed; use startupTimeoutMs and provider/model token limits',
+			);
 		}
 		if (key === "maxTurns" || key === "maxToolCalls") {
-			throw fail(`${path}.${key}`, `"${key}" was removed; use timeoutMs/maxOutputBytes`);
+			throw fail(`${path}.${key}`, `"${key}" was removed; use startupTimeoutMs and provider/model token limits`);
 		}
 		if (!KNOWN_PREFERENCE_KEYS.has(key)) throw fail(`${path}.${key}`, `unknown preference key "${key}"`);
 	}
@@ -173,20 +177,20 @@ function parsePreferenceFields(
 		}
 		fields.thinking = raw.thinking as SubagentThinkingLevel;
 	}
-	if (raw.timeoutMs !== undefined) {
-		fields.timeoutMs = checkPositiveInteger(
-			raw.timeoutMs,
-			`${path}.timeoutMs`,
-			ICE_SUBAGENT_SETTINGS_LIMITS.minTimeoutMs,
-			ICE_SUBAGENT_SETTINGS_LIMITS.maxTimeoutMs,
+	if (raw.checkInIntervalMs !== undefined) {
+		fields.checkInIntervalMs = checkPositiveInteger(
+			raw.checkInIntervalMs,
+			`${path}.checkInIntervalMs`,
+			ICE_SUBAGENT_SETTINGS_LIMITS.minCheckInIntervalMs,
+			Number.MAX_SAFE_INTEGER,
 		);
 	}
-	if (raw.maxOutputBytes !== undefined) {
-		fields.maxOutputBytes = checkPositiveInteger(
-			raw.maxOutputBytes,
-			`${path}.maxOutputBytes`,
-			ICE_SUBAGENT_SETTINGS_LIMITS.minOutputBytes,
-			ICE_SUBAGENT_SETTINGS_LIMITS.maxOutputBytes,
+	if (raw.startupTimeoutMs !== undefined) {
+		fields.startupTimeoutMs = checkPositiveInteger(
+			raw.startupTimeoutMs,
+			`${path}.startupTimeoutMs`,
+			ICE_SUBAGENT_SETTINGS_LIMITS.minStartupTimeoutMs,
+			ICE_SUBAGENT_SETTINGS_LIMITS.maxStartupTimeoutMs,
 		);
 	}
 	if (raw.temperature !== undefined) {
@@ -214,8 +218,7 @@ export interface ParsedIceSubagentSettings {
 	allowedRoles: readonly string[] | undefined;
 	roleDefaults: Readonly<Record<string, IceSubagentPreferenceFields>>;
 	restrictions: {
-		maxTimeoutMs?: number;
-		maxOutputBytes?: number;
+		maxStartupTimeoutMs?: number;
 		denyRoles: readonly string[];
 		denyTools: readonly string[];
 	};
@@ -272,38 +275,41 @@ export function parseIceSubagentSettings(input: unknown, path = "ice.subagents")
 		roleDefaults = Object.freeze(roleDefaults);
 	}
 	const restrictions = {
-		maxTimeoutMs: undefined as number | undefined,
-		maxOutputBytes: undefined as number | undefined,
+		maxStartupTimeoutMs: undefined as number | undefined,
 		denyRoles: [] as string[],
 		denyTools: [] as string[],
 	};
 	if (input.restrictions !== undefined) {
 		if (!isRecord(input.restrictions)) throw fail(`${path}.restrictions`, "expected object");
 		for (const key of Object.keys(input.restrictions)) {
+			if (key === "maxOutputBytes") {
+				throw fail(
+					`${path}.restrictions.${key}`,
+					"removed; final-answer retention is controlled by fixed host limits",
+				);
+			}
 			if (key === "maxTotalTokens") {
-				throw fail(`${path}.restrictions.${key}`, '"maxTotalTokens" was removed; use timeoutMs/maxOutputBytes');
+				throw fail(
+					`${path}.restrictions.${key}`,
+					'"maxTotalTokens" was removed; use startupTimeoutMs and provider/model token limits',
+				);
 			}
 			if (key === "maxTurns" || key === "maxToolCalls") {
-				throw fail(`${path}.restrictions.${key}`, `"${key}" was removed; use timeoutMs/maxOutputBytes`);
+				throw fail(
+					`${path}.restrictions.${key}`,
+					`"${key}" was removed; use startupTimeoutMs and provider/model token limits`,
+				);
 			}
 			if (!KNOWN_RESTRICTION_KEYS.has(key))
 				throw fail(`${path}.restrictions.${key}`, `unknown enforcement key "${key}"`);
 		}
 		const raw = input.restrictions as Record<string, unknown>;
-		if (raw.maxTimeoutMs !== undefined) {
-			restrictions.maxTimeoutMs = checkPositiveInteger(
-				raw.maxTimeoutMs,
-				`${path}.restrictions.maxTimeoutMs`,
-				ICE_SUBAGENT_SETTINGS_LIMITS.minTimeoutMs,
-				ICE_SUBAGENT_SETTINGS_LIMITS.maxTimeoutMs,
-			);
-		}
-		if (raw.maxOutputBytes !== undefined) {
-			restrictions.maxOutputBytes = checkPositiveInteger(
-				raw.maxOutputBytes,
-				`${path}.restrictions.maxOutputBytes`,
-				ICE_SUBAGENT_SETTINGS_LIMITS.minOutputBytes,
-				ICE_SUBAGENT_SETTINGS_LIMITS.maxOutputBytes,
+		if (raw.maxStartupTimeoutMs !== undefined) {
+			restrictions.maxStartupTimeoutMs = checkPositiveInteger(
+				raw.maxStartupTimeoutMs,
+				`${path}.restrictions.maxStartupTimeoutMs`,
+				ICE_SUBAGENT_SETTINGS_LIMITS.minStartupTimeoutMs,
+				ICE_SUBAGENT_SETTINGS_LIMITS.maxStartupTimeoutMs,
 			);
 		}
 		if (raw.denyRoles !== undefined) {
@@ -563,8 +569,8 @@ export interface IceResolvedField<T> {
 export interface IceResolvedSubagentContract {
 	enabled: boolean;
 	thinking: IceResolvedField<SubagentThinkingLevel>;
+	checkInIntervalMs: IceResolvedField<number>;
 	timeoutMs: IceResolvedField<number>;
-	maxOutputBytes: IceResolvedField<number>;
 	temperature: IceResolvedField<number | undefined>;
 	topP: IceResolvedField<number | undefined>;
 	allowedRoles: IceResolvedField<readonly string[] | undefined>;
@@ -574,16 +580,16 @@ export interface IceResolvedSubagentContract {
 	/** W06: legacy flat projection for compact consumers (values only). */
 	values: {
 		thinking: SubagentThinkingLevel;
+		checkInIntervalMs: number;
 		timeoutMs: number;
-		maxOutputBytes: number;
 		temperature?: number;
 		topP?: number;
 	};
 	/** W06: legacy flat projection for compact consumers (sources only). */
 	sources: {
 		thinking: IceSettingSource;
+		checkInIntervalMs: IceSettingSource;
 		timeoutMs: IceSettingSource;
-		maxOutputBytes: IceSettingSource;
 		temperature: IceSettingSource;
 		topP: IceSettingSource;
 	};
@@ -617,8 +623,8 @@ export interface IceResolverInput {
 
 const BUNDLED_CONTRACT_DEFAULTS: IceSubagentPreferenceFields = Object.freeze({
 	thinking: "medium",
-	timeoutMs: 120_000,
-	maxOutputBytes: 24_576,
+	checkInIntervalMs: 120_000,
+	startupTimeoutMs: 120_000,
 });
 
 function frozenDiagnostics(values: string[]): readonly string[] {
@@ -735,8 +741,8 @@ export function resolveIceSubagentContract(input: IceResolverInput): IceResolved
 
 	const call = input.call ?? {};
 	const thinking = resolveField("thinking", call.thinking);
-	const timeoutMs = resolveField("timeoutMs", call.timeoutMs);
-	const maxOutputBytes = resolveField("maxOutputBytes", call.maxOutputBytes);
+	const checkInIntervalMs = resolveField("checkInIntervalMs", call.checkInIntervalMs);
+	const timeoutMs = resolveField("startupTimeoutMs", call.startupTimeoutMs);
 	const resolveOptionalField = (
 		key: "temperature" | "topP",
 		callValue: number | undefined,
@@ -770,18 +776,13 @@ export function resolveIceSubagentContract(input: IceResolverInput): IceResolved
 	// W06: enforced hard caps use the most restrictive applicable cap and are not
 	// another preference layer. Preference values above a cap are clamped with an
 	// explicit diagnostic; the enforced source label records the restriction.
-	const caps: Array<{
-		key: "timeoutMs" | "maxOutputBytes";
-		values: Array<number | undefined>;
-	}> = [
-		{ key: "timeoutMs", values: [globalParsed.restrictions.maxTimeoutMs, projectParsed.restrictions.maxTimeoutMs] },
+	const caps: Array<{ key: "startupTimeoutMs"; values: Array<number | undefined> }> = [
 		{
-			key: "maxOutputBytes",
-			values: [globalParsed.restrictions.maxOutputBytes, projectParsed.restrictions.maxOutputBytes],
+			key: "startupTimeoutMs",
+			values: [globalParsed.restrictions.maxStartupTimeoutMs, projectParsed.restrictions.maxStartupTimeoutMs],
 		},
 	];
 	const resolvedTimeoutMs: IceResolvedField<number> = timeoutMs;
-	const resolvedMaxOutputBytes: IceResolvedField<number> = maxOutputBytes;
 	const clampToCap = (field: IceResolvedField<number>, cap: number, key: string): IceResolvedField<number> => {
 		if (field.value <= cap) return field;
 		diagnostics.push(`${key} clamped to enforced cap ${cap} (requested ${field.value} from ${field.source})`);
@@ -791,13 +792,7 @@ export function resolveIceSubagentContract(input: IceResolverInput): IceResolved
 		const applicable = caps[0]!.values.filter((value): value is number => value !== undefined);
 		return applicable.length === 0
 			? resolvedTimeoutMs
-			: clampToCap(resolvedTimeoutMs, Math.min(...applicable), "timeoutMs");
-	})();
-	const cappedMaxOutputBytes = (() => {
-		const applicable = caps[1]!.values.filter((value): value is number => value !== undefined);
-		return applicable.length === 0
-			? resolvedMaxOutputBytes
-			: clampToCap(resolvedMaxOutputBytes, Math.min(...applicable), "maxOutputBytes");
+			: clampToCap(resolvedTimeoutMs, Math.min(...applicable), "startupTimeoutMs");
 	})();
 
 	// W06: allowed roles intersect across layers; project narrowing can never
@@ -826,15 +821,15 @@ export function resolveIceSubagentContract(input: IceResolverInput): IceResolved
 			message: `Role "${canonicalRole}" is not in the ice.subagents allowedRoles set (requested "${requestedRole}").`,
 		};
 	}
-	const restrictionsApplied = diagnostics.some((entry) => entry.includes("timeoutMs clamped")) ? ["timeoutMs"] : [];
-	if (diagnostics.some((entry) => entry.includes("maxOutputBytes clamped")))
-		restrictionsApplied.push("maxOutputBytes");
+	const restrictionsApplied = diagnostics.some((entry) => entry.includes("startupTimeoutMs clamped"))
+		? ["startupTimeoutMs"]
+		: [];
 
 	const contract: IceResolvedSubagentContract = {
 		enabled,
 		thinking,
+		checkInIntervalMs,
 		timeoutMs: cappedTimeoutMs,
-		maxOutputBytes: cappedMaxOutputBytes,
 		temperature,
 		topP,
 		allowedRoles: {
@@ -847,15 +842,15 @@ export function resolveIceSubagentContract(input: IceResolverInput): IceResolved
 		rejected: frozenDiagnostics(rejected),
 		values: {
 			thinking: thinking.value,
+			checkInIntervalMs: checkInIntervalMs.value,
 			timeoutMs: cappedTimeoutMs.value,
-			maxOutputBytes: cappedMaxOutputBytes.value,
 			...(temperature.value !== undefined ? { temperature: temperature.value } : {}),
 			...(topP.value !== undefined ? { topP: topP.value } : {}),
 		},
 		sources: {
 			thinking: thinking.source,
+			checkInIntervalMs: checkInIntervalMs.source,
 			timeoutMs: cappedTimeoutMs.source,
-			maxOutputBytes: cappedMaxOutputBytes.source,
 			temperature: temperature.source,
 			topP: topP.source,
 		},

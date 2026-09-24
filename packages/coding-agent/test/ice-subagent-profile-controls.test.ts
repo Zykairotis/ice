@@ -34,9 +34,14 @@ function profile(metadata: string) {
 }
 
 describe("profile control validation and parent registration", () => {
-	it("rejects unknown security-bearing metadata", () => {
+	it("rejects unknown security-bearing metadata and removed output-cap aliases", () => {
 		const options = profile("restrictions:\n  denyTools: [read]");
 		expect(() => resolveSubagentProfileResolution("audit", options)).toThrow(/Unsupported role metadata/);
+		for (const field of ["max-output-bytes", "maxOutputBytes", "max_output_bytes"]) {
+			expect(() => resolveSubagentProfileResolution("audit", profile(`${field}: 8192`))).toThrow(
+				/output cap metadata was removed.*fixed host limits/i,
+			);
+		}
 	});
 	it("parses bounded execution preferences and rejects malformed sampling metadata", () => {
 		const options = profile("temperature: 0.35\ntop-p: 0.8");
@@ -53,10 +58,10 @@ describe("profile control validation and parent registration", () => {
 			options,
 		);
 		expect(request.execution).toMatchObject({
-			maxOutputBytes: 24 * 1024,
 			temperature: 0.35,
 			topP: 0.8,
 		});
+		expect(request.execution).not.toHaveProperty("maxOutputBytes");
 		const invalidTemperature = profile("temperature: nope");
 		expect(() => resolveSubagentProfileResolution("audit", invalidTemperature)).toThrow(/temperature/i);
 		expect(() => resolveSubagentProfileResolution("audit", profile("top-p: 1.1"))).toThrow(/top-p/i);

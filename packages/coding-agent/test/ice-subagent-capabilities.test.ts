@@ -95,7 +95,14 @@ describe("parent-owned delegable capabilities", () => {
 		expect(() => registerIceDelegableTool({}, definition({ adapterId: "invalid adapter id" }))).toThrow(/adapter ID/);
 	});
 	it("rejects built-in replacements, recursion, management, invalid schemas, and missing scope guarantees", () => {
-		for (const name of ["read", "delegate", "manage_subagent", "delegate_async", "shutdown"]) {
+		for (const name of [
+			"read",
+			"delegate",
+			"manage_subagent",
+			"delegate_async",
+			"read_subagent_output",
+			"shutdown",
+		]) {
 			expect(() => registerIceDelegableTool({}, definition({ name }))).toThrow();
 		}
 		expect(() => registerIceDelegableTool({}, definition({ childSafe: false as never }))).toThrow(/child-safe/);

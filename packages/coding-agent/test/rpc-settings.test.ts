@@ -92,6 +92,12 @@ describe("RPC settings bridge", () => {
 		expect(snapshot.fields.some((item) => item.key === "trackingId")).toBe(false);
 		expect(snapshot.fields.some((item) => item.key === "extensions")).toBe(false);
 		expect(snapshot.fields.some((item) => item.key === "extension.demo.submenu")).toBe(false);
+		expect(snapshot.fields.some((item) => item.key === "ice.subagents.defaults.timeoutMs")).toBe(false);
+		expect(field(snapshot, "ice.subagents.defaults.startupTimeoutMs")).toMatchObject({
+			label: "Subagent startup timeout",
+			value: 120_000,
+			effectiveValue: 120_000,
+		});
 		expect(snapshot.fields.every((item) => !item.description?.includes("/secret/extension.ts"))).toBe(true);
 		expect(field(snapshot, "terminal.showImages").restartRequired).toBe(true);
 		expect(field(snapshot, "terminal.showImages").hostOnly).toBe(true);
@@ -162,7 +168,7 @@ describe("RPC settings bridge", () => {
 	});
 
 	it("attributes malformed global and project ICE policies to their actual source", async () => {
-		const invalidIce = { subagents: { defaults: { maxOutputBytes: "not-a-number" } } } as never;
+		const invalidIce = { subagents: { defaults: { startupTimeoutMs: "not-a-number" } } } as never;
 		const globalInvalid = SettingsManager.inMemory({ ice: invalidIce });
 		const globalSnapshot = createRpcSettingsSnapshot(createContext(globalInvalid));
 		expect(globalSnapshot.diagnostics).toContainEqual({
@@ -332,14 +338,18 @@ describe("RPC settings bridge", () => {
 		).rejects.toMatchObject({ code: "persistence_failed", scope: "global" });
 	});
 
-	it("labels the subagent result byte cap as an output authority", () => {
+	it("removes the caller-controlled subagent final-answer byte cap", async () => {
 		const settingsManager = SettingsManager.inMemory();
-		const snapshot = createRpcSettingsSnapshot(
-			createContext(settingsManager, { getExtensionSettings: () => [createExtensionSettings()] }),
-		);
+		const context = createContext(settingsManager);
+		const snapshot = createRpcSettingsSnapshot(context);
 
-		const bytes = field(snapshot, "ice.subagents.defaults.maxOutputBytes");
-		expect(bytes.label).toBe("Subagent result size cap");
-		expect(bytes.description).toMatch(/not model tokens or cost/i);
+		expect(snapshot.fields.some((item) => item.key === "ice.subagents.defaults.maxOutputBytes")).toBe(false);
+		await expect(
+			applyRpcSetting(context, {
+				key: "ice.subagents.defaults.maxOutputBytes",
+				scope: "global",
+				value: 8_192,
+			}),
+		).rejects.toMatchObject({ code: "unknown_key" });
 	});
 });

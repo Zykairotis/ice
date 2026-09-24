@@ -99,6 +99,7 @@ function completedBatchResult(task: ResolvedSubagentBatchTask): SubagentResult {
 		source: task.request.profile.source,
 		status: "completed",
 		summary: "ok",
+		output: { text: "ok", textBytes: 2, originalBytes: 2, inlineTruncated: false, captureStatus: "inline_complete" },
 		observedOutputBytes: 2,
 		partial: false,
 		diagnostics: [],
@@ -224,7 +225,7 @@ describe("shared admission across background jobs", () => {
 		expect(a.status).toBe("created");
 		expect(b.status).toBe("created");
 		expect(c.status).toBe("queued");
-		expect(registry.inspect(c.jobId).budget).toMatchObject({
+		expect(registry.inspect(c.jobId).scheduling).toMatchObject({
 			ownerActiveJobs: 2,
 			ownerQueuedJobs: 1,
 			ownerActiveJobsCap: 2,
@@ -240,81 +241,6 @@ describe("shared admission across background jobs", () => {
 		await flush();
 		await flush();
 		expect(registry.inspect(c.jobId).job.status).toBe("completed");
-		expect(admission.active).toBe(0);
-	});
-
-	it("retains shared permits for needs_time runs until resume and terminal settlement", async () => {
-		const admission = new SubagentConcurrencyAdmission(1);
-		const first = deferredRun();
-		const second = deferredRun();
-		const registry = new SubagentJobRegistry({
-			ownerSessionId: "owner-a",
-			persist: () => {},
-			notify: () => {},
-			maxActiveJobs: 8,
-			admission,
-		});
-		const a = launch(registry, first.run);
-		const b = launch(registry, second.run);
-		expect(a.status).toBe("created");
-		expect(b.status).toBe("queued");
-
-		first.settle({
-			...completedRun(),
-			result: { ...completedRun().result, status: "needs_time", runId: "run-deferred" },
-		});
-		await flush();
-		expect(registry.inspect(a.jobId).job.status).toBe("needs_time");
-		expect(registry.inspect(b.jobId).job.status).toBe("queued");
-		expect(admission.active).toBe(1);
-
-		expect(registry.markManagedRunState("run-deferred", "running")).toBe(true);
-		expect(registry.inspect(a.jobId).job.status).toBe("running");
-		expect(registry.inspect(b.jobId).job.status).toBe("queued");
-		expect(admission.active).toBe(1);
-
-		expect(await registry.resolveManagedRun("run-deferred", completedRun())).toBe(true);
-		await flush();
-		expect(registry.inspect(b.jobId).job.status).toBe("running");
-		expect(admission.active).toBe(1);
-
-		second.settle();
-		await flush();
-		await flush();
-		expect(admission.active).toBe(0);
-	});
-
-	it("releases a retained needs_time permit exactly once on cancellation", async () => {
-		const admission = new SubagentConcurrencyAdmission(1);
-		const first = deferredRun();
-		const second = deferredRun();
-		const registry = new SubagentJobRegistry({
-			ownerSessionId: "owner-a",
-			persist: () => {},
-			notify: () => {},
-			maxActiveJobs: 8,
-			admission,
-		});
-		const a = launch(registry, first.run);
-		const b = launch(registry, second.run);
-		first.settle({
-			...completedRun(),
-			result: { ...completedRun().result, status: "needs_time", runId: "run-cancelled" },
-		});
-		await flush();
-		await flush();
-		expect(registry.inspect(a.jobId).job.status).toBe("needs_time");
-		expect(registry.inspect(b.jobId).job.status).toBe("queued");
-		expect(admission.active).toBe(1);
-
-		const cancelled = await registry.cancel(a.jobId);
-		expect(cancelled.job.status).toBe("cancelled");
-		expect(registry.inspect(b.jobId).job.status).toBe("running");
-		expect(admission.active).toBe(1);
-
-		second.settle();
-		await flush();
-		await flush();
 		expect(admission.active).toBe(0);
 	});
 
@@ -523,6 +449,13 @@ describe("shared admission across concurrent batches", () => {
 						source: owner.request.profile.source,
 						status: "completed" as const,
 						summary: "ok",
+						output: {
+							text: "ok",
+							textBytes: 2,
+							originalBytes: 2,
+							inlineTruncated: false,
+							captureStatus: "inline_complete" as const,
+						},
 						observedOutputBytes: 2,
 						partial: false,
 						diagnostics: [],

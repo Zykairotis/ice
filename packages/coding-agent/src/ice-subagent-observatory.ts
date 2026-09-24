@@ -1,6 +1,7 @@
 import { relative, resolve, sep } from "node:path";
 import { stripTerminalSequences } from "@zykairotis/ice-tui";
 import { isSubagentProfileColor, type SubagentProfileColor } from "./ice-agent-view-bridge.ts";
+import type { SubagentCheckInState } from "./ice-subagent-checkin.ts";
 import type {
 	SubagentJobInspection,
 	SubagentJobResultEnvelope,
@@ -8,8 +9,15 @@ import type {
 	TerminalSubagentJobStatus,
 } from "./ice-subagent-jobs.ts";
 import { JOB_COMPLETION_MESSAGE_TYPE } from "./ice-subagent-jobs.ts";
-import type { SubagentRetryState } from "./ice-subagent-timeout-supervisor.ts";
-import type { SubagentBatchTaskLifecycleEvent, SubagentEvent, SubagentStatus, SubagentUsage } from "./ice-subagents.ts";
+import type { SubagentRetryState, SubagentRuntimeAttention } from "./ice-subagent-timeout-supervisor.ts";
+import type {
+	SubagentBatchTaskLifecycleEvent,
+	SubagentCompactionReason,
+	SubagentCompactionStatus,
+	SubagentEvent,
+	SubagentStatus,
+	SubagentUsage,
+} from "./ice-subagents.ts";
 import { redactCredentialText } from "./utils/redact.ts";
 
 export const OBSERVATORY_RECENT_LIMIT = 32;
@@ -60,7 +68,6 @@ export type ObservatoryPhase =
 	| "compacting"
 	| "retrying"
 	| "wrapping_up"
-	| "needs_time"
 	| "completed"
 	| "failed"
 	| "cancelled"
@@ -93,7 +100,14 @@ export interface SubagentProgressSnapshot {
 	readonly schemaVersion: 1;
 	readonly streamKey: string;
 	readonly toolName: ObservatoryToolName;
+	/** Session that owns the observed child run. Present for runtime child events. */
+	readonly parentSessionId?: string;
+	/** Exact child session when the runtime has admitted one. */
+	readonly childSessionId?: string;
+	/** Exact lifecycle event that produced this snapshot. */
+	readonly eventType?: SubagentEvent["type"];
 	readonly runId?: string;
+	readonly toolCallId?: string;
 	readonly batchId?: string;
 	readonly taskId?: string;
 	readonly batchIndex?: number;
@@ -110,8 +124,13 @@ export interface SubagentProgressSnapshot {
 	readonly attempt?: 1 | 2;
 	readonly attemptHistory: readonly ObservatoryAttemptHistory[];
 	readonly retry?: SubagentRetryState;
+	readonly attention?: SubagentRuntimeAttention;
+	readonly checkIn?: SubagentCheckInState;
 	readonly usage?: SubagentUsage;
 	readonly batchCounts?: ObservatoryBatchCounts;
+	readonly compactionReason?: SubagentCompactionReason;
+	readonly compactionStatus?: SubagentCompactionStatus;
+	readonly compactionWillRetry?: boolean;
 	readonly evidenceCount?: number;
 	readonly changedFileCount?: number;
 	readonly artifactReady?: boolean;
@@ -145,7 +164,11 @@ export interface ObservatoryRuntimeInput {
 export interface ObservatoryWorkflowInput {
 	readonly streamKey: string;
 	readonly toolName: ObservatoryToolName;
+	readonly parentSessionId?: string;
+	readonly childSessionId?: string;
+	readonly eventType?: SubagentEvent["type"];
 	readonly runId?: string;
+	readonly toolCallId?: string;
 	readonly batchId?: string;
 	readonly taskId?: string;
 	readonly batchIndex?: number;
@@ -161,7 +184,11 @@ export interface ObservatoryWorkflowInput {
 	readonly attempt?: 1 | 2;
 	readonly usage?: SubagentUsage;
 	readonly retry?: SubagentRetryState;
+	readonly attention?: SubagentRuntimeAttention;
 	readonly batchCounts?: ObservatoryBatchCounts;
+	readonly compactionReason?: SubagentCompactionReason;
+	readonly compactionStatus?: SubagentCompactionStatus;
+	readonly compactionWillRetry?: boolean;
 	readonly evidenceCount?: number;
 	readonly changedFileCount?: number;
 	readonly artifactReady?: boolean;
@@ -191,10 +218,6 @@ export interface DurableSubagentJobViewSnapshot {
 	readonly role: string;
 	readonly model?: string;
 	readonly queuePosition?: number;
-	readonly plannedOutputBytes: number;
-	readonly reservedOutputBytes: number;
-	readonly ownerReservedOutputBytes: number;
-	readonly ownerBudgetBytes: number;
 	/** Durable-job admission snapshot; batch queue counts remain in batchCounts. */
 	readonly ownerActiveJobs?: number;
 	readonly ownerQueuedJobs?: number;
@@ -265,17 +288,13 @@ export interface DurableSubagentJobResultView {
 	};
 }
 
-function boundedByteCount(value: number | undefined): number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
 function boundedSingleLine(value: string | undefined, maxBytes: number): string | undefined {
 	return boundedText(value, maxBytes)?.replace(/[\r\n\t]+/g, " ");
 }
 
 export function projectDurableSubagentJob(inspection: SubagentJobInspection): DurableSubagentJobViewSnapshot {
 	const job = inspection.job;
-	const budget = inspection.budget;
+	const scheduling = inspection.scheduling;
 	const jobId = boundedText(job.jobId, 128) ?? "unknown";
 	const model = job.model ? boundedSingleLine(job.model, OBSERVATORY_PATH_MAX_BYTES) : undefined;
 	const startedAt = job.startedAt ? boundedSingleLine(job.startedAt, OBSERVATORY_PATH_MAX_BYTES) : undefined;
@@ -289,13 +308,9 @@ export function projectDurableSubagentJob(inspection: SubagentJobInspection): Du
 		...(inspection.queuePosition !== undefined && inspection.queuePosition > 0
 			? { queuePosition: inspection.queuePosition }
 			: {}),
-		plannedOutputBytes: boundedByteCount(budget?.plannedOutputBytes ?? job.plannedOutputBytes),
-		reservedOutputBytes: boundedByteCount(budget?.reservedOutputBytes ?? job.reservedOutputBytes),
-		ownerReservedOutputBytes: boundedByteCount(budget?.ownerReservedOutputBytes),
-		ownerBudgetBytes: boundedByteCount(budget?.ownerBudgetBytes),
-		...(budget?.ownerActiveJobs !== undefined ? { ownerActiveJobs: budget.ownerActiveJobs } : {}),
-		...(budget?.ownerQueuedJobs !== undefined ? { ownerQueuedJobs: budget.ownerQueuedJobs } : {}),
-		...(budget?.ownerActiveJobsCap !== undefined ? { ownerActiveJobsCap: budget.ownerActiveJobsCap } : {}),
+		...(scheduling ? { ownerActiveJobs: scheduling.ownerActiveJobs } : {}),
+		...(scheduling ? { ownerQueuedJobs: scheduling.ownerQueuedJobs } : {}),
+		...(scheduling ? { ownerActiveJobsCap: scheduling.ownerActiveJobsCap } : {}),
 		createdAt: boundedSingleLine(job.createdAt, OBSERVATORY_PATH_MAX_BYTES) ?? "",
 		...(startedAt ? { startedAt } : {}),
 		...(finishedAt ? { finishedAt } : {}),
@@ -635,7 +650,6 @@ function formatDurableJobSnapshot(snapshot: DurableSubagentJobViewSnapshot): str
 					`admission active ${snapshot.ownerActiveJobs}, queued ${snapshot.ownerQueuedJobs}, cap ${snapshot.ownerActiveJobsCap}`,
 				]
 			: []),
-		`reservation ${snapshot.reservedOutputBytes}/${snapshot.ownerBudgetBytes} bytes`,
 		`created ${snapshot.createdAt}`,
 		...(snapshot.startedAt ? [`started ${snapshot.startedAt}`] : []),
 		...(snapshot.finishedAt ? [`finished ${snapshot.finishedAt}`] : []),
@@ -719,8 +733,6 @@ function phaseForRuntimeEvent(event: SubagentEvent, previous: SubagentProgressSn
 			return "retrying";
 		case "subagent_wrap_up":
 			return "wrapping_up";
-		case "subagent_needs_time":
-			return "needs_time";
 		case "subagent_completed":
 			return "completed";
 		case "subagent_failed":
@@ -744,7 +756,11 @@ function createSnapshot(input: {
 	phase: ObservatoryPhase;
 	status: string;
 	terminal: boolean;
+	parentSessionId?: string;
+	childSessionId?: string;
+	eventType?: SubagentEvent["type"];
 	runId?: string;
+	toolCallId?: string;
 	batchId?: string;
 	taskId?: string;
 	batchIndex?: number;
@@ -759,6 +775,11 @@ function createSnapshot(input: {
 	attemptHistory?: readonly ObservatoryAttemptHistory[];
 	activity?: readonly ObservatoryActivity[];
 	retry?: SubagentRetryState;
+	attention?: SubagentRuntimeAttention;
+	checkIn?: SubagentCheckInState;
+	compactionReason?: SubagentCompactionReason;
+	compactionStatus?: SubagentCompactionStatus;
+	compactionWillRetry?: boolean;
 	evidenceCount?: number;
 	changedFileCount?: number;
 	artifactReady?: boolean;
@@ -772,7 +793,11 @@ function createSnapshot(input: {
 		schemaVersion: 1,
 		streamKey: input.streamKey,
 		toolName: input.toolName,
+		...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+		...(input.childSessionId ? { childSessionId: input.childSessionId } : {}),
+		...(input.eventType ? { eventType: input.eventType } : {}),
 		...(input.runId ? { runId: input.runId } : {}),
+		...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
 		...(input.batchId ? { batchId: input.batchId } : {}),
 		...(input.taskId ? { taskId: input.taskId } : {}),
 		...(input.batchIndex !== undefined ? { batchIndex: input.batchIndex } : {}),
@@ -789,8 +814,13 @@ function createSnapshot(input: {
 		...(input.attempt ? { attempt: input.attempt } : {}),
 		attemptHistory: Object.freeze((input.attemptHistory ?? []).slice(-OBSERVATORY_ATTEMPT_LIMIT)),
 		...(input.retry ? { retry: Object.freeze({ ...input.retry }) } : {}),
+		...(input.attention ? { attention: Object.freeze({ ...input.attention }) } : {}),
+		...(input.checkIn ? { checkIn: Object.freeze({ ...input.checkIn }) } : {}),
 		...(input.usage ? { usage: input.usage } : {}),
 		...(input.batchCounts ? { batchCounts: Object.freeze({ ...input.batchCounts }) } : {}),
+		...(input.compactionReason ? { compactionReason: input.compactionReason } : {}),
+		...(input.compactionStatus ? { compactionStatus: input.compactionStatus } : {}),
+		...(input.compactionWillRetry !== undefined ? { compactionWillRetry: input.compactionWillRetry } : {}),
 		...(input.evidenceCount !== undefined ? { evidenceCount: input.evidenceCount } : {}),
 		...(input.changedFileCount !== undefined ? { changedFileCount: input.changedFileCount } : {}),
 		...(input.artifactReady !== undefined ? { artifactReady: input.artifactReady } : {}),
@@ -1028,7 +1058,11 @@ export function reduceObservatoryEvent(state: ObservatoryState, input: Observato
 		phase,
 		status: input.event.status,
 		terminal: runtimeIsTerminal(input.event),
+		parentSessionId: input.event.parentSessionId ?? existing?.parentSessionId,
+		childSessionId: input.event.childSessionId ?? existing?.childSessionId,
+		eventType: input.event.type,
 		runId: input.event.runId,
+		toolCallId: input.event.toolCallId ?? existing?.toolCallId,
 		batchId: input.event.batchId ?? existing?.batchId,
 		taskId: input.taskId ?? input.event.taskId ?? existing?.taskId,
 		batchIndex: existing?.batchIndex,
@@ -1040,6 +1074,11 @@ export function reduceObservatoryEvent(state: ObservatoryState, input: Observato
 		currentPath: currentPath ?? existing?.currentPath,
 		usage: input.usage ?? existing?.usage,
 		retry: input.event.retry ?? existing?.retry,
+		attention: input.event.attention ?? existing?.attention,
+		checkIn: existing?.checkIn,
+		compactionReason: input.event.compactionReason ?? existing?.compactionReason,
+		compactionStatus: input.event.compactionStatus ?? existing?.compactionStatus,
+		compactionWillRetry: input.event.compactionWillRetry ?? existing?.compactionWillRetry,
 		attemptHistory,
 		activity: activityFor(existing, phase, input.event.toolName, currentPath),
 	});
@@ -1079,7 +1118,11 @@ export function reduceWorkflowProgress(state: ObservatoryState, input: Observato
 		phase: input.phase,
 		status: input.status,
 		terminal: workflowIsTerminal(input.toolName, input.phase),
+		parentSessionId: input.parentSessionId ?? existing?.parentSessionId,
+		childSessionId: input.childSessionId ?? existing?.childSessionId,
+		eventType: input.eventType ?? existing?.eventType,
 		runId: input.runId ?? existing?.runId,
+		toolCallId: input.toolCallId ?? existing?.toolCallId,
 		batchId: input.batchId ?? existing?.batchId,
 		taskId: input.taskId ?? existing?.taskId,
 		batchIndex: input.batchIndex ?? existing?.batchIndex,
@@ -1091,7 +1134,12 @@ export function reduceWorkflowProgress(state: ObservatoryState, input: Observato
 		currentPath: currentPath ?? existing?.currentPath,
 		usage: input.usage ?? existing?.usage,
 		retry: input.retry ?? existing?.retry,
+		attention: input.attention ?? existing?.attention,
+		checkIn: existing?.checkIn,
 		batchCounts: input.batchCounts ?? existing?.batchCounts,
+		compactionReason: input.compactionReason ?? existing?.compactionReason,
+		compactionStatus: input.compactionStatus ?? existing?.compactionStatus,
+		compactionWillRetry: input.compactionWillRetry ?? existing?.compactionWillRetry,
 		attemptHistory,
 		activity: activityFor(existing, input.phase, existing?.currentTool, currentPath),
 		evidenceCount: input.evidenceCount ?? existing?.evidenceCount,
@@ -1146,12 +1194,28 @@ export class SubagentObservatoryStore {
 		return this.publish(workflow.streamKey);
 	}
 
+	updateCheckInState(runId: string, checkIn: SubagentCheckInState | undefined): boolean {
+		let updated = false;
+		const update = (snapshot: SubagentProgressSnapshot): SubagentProgressSnapshot => {
+			if (snapshot.runId !== runId) return snapshot;
+			updated = true;
+			const { checkIn: _previous, ...withoutCheckIn } = snapshot;
+			return Object.freeze(checkIn ? { ...withoutCheckIn, checkIn: Object.freeze({ ...checkIn }) } : withoutCheckIn);
+		};
+		const active = this.state.active.map(update);
+		const recent = this.state.recent.map(update);
+		if (!updated) return false;
+		this.state = Object.freeze({ active: Object.freeze(active), recent: Object.freeze(recent) });
+		this.publishState();
+		return true;
+	}
+
 	subscribe(listener: (state: ObservatoryState) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	}
 
-	private publish(streamKey: string): SubagentProgressSnapshot | undefined {
+	private publishState(): void {
 		for (const listener of this.listeners) {
 			try {
 				listener(this.state);
@@ -1159,6 +1223,10 @@ export class SubagentObservatoryStore {
 				// Observability consumers are non-authoritative and must not affect execution.
 			}
 		}
+	}
+
+	private publish(streamKey: string): SubagentProgressSnapshot | undefined {
+		this.publishState();
 		return findExisting(this.state, streamKey);
 	}
 }
@@ -1181,6 +1249,31 @@ export function getProgressSnapshot(details: unknown): SubagentProgressSnapshot 
 function formatDuration(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function formatCheckInState(state: SubagentCheckInState): string {
+	const delivery =
+		state.delivery === "owner_unavailable"
+			? "overdue; owner unavailable"
+			: state.delivery === "due"
+				? "overdue; awaiting parent"
+				: state.delivery === "queued_for_parent"
+					? "pending parent review"
+					: state.delivery === "consumed"
+						? "parent reviewing"
+						: state.delivery === "acknowledged"
+							? "acknowledged"
+							: "armed";
+	const nextDue = state.nextDueAt === undefined ? undefined : new Date(state.nextDueAt).toISOString();
+	const acknowledged =
+		state.lastAcknowledgedAt === undefined ? undefined : new Date(state.lastAcknowledgedAt).toISOString();
+	return [
+		`check-in ${delivery}`,
+		nextDue ? `next ${nextDue}` : undefined,
+		acknowledged ? `last acknowledged ${acknowledged}` : undefined,
+	]
+		.filter((part): part is string => part !== undefined)
+		.join(" · ");
 }
 
 function formatBatchCounts(counts: ObservatoryBatchCounts): string {
@@ -1214,6 +1307,7 @@ export function formatProgressSnapshot(snapshot: SubagentProgressSnapshot): stri
 		...(snapshot.currentTool || snapshot.currentPath
 			? [`current ${snapshot.currentTool ?? "activity"}${snapshot.currentPath ? ` ${snapshot.currentPath}` : ""}`]
 			: []),
+		...(snapshot.checkIn ? [formatCheckInState(snapshot.checkIn)] : []),
 		...(snapshot.activity.length > 0
 			? snapshot.activity
 					.slice(-6)

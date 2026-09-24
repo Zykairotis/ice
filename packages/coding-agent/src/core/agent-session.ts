@@ -980,6 +980,7 @@ export class AgentSession {
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
 		return (
+			this._compactionInFlight ||
 			this._autoCompactionAbortController !== undefined ||
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
@@ -1171,7 +1172,11 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController !== undefined) {
+			if (
+				this._compactionInFlight ||
+				this._autoCompactionAbortController !== undefined ||
+				this._compactionAbortController !== undefined
+			) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 				);
@@ -1894,15 +1899,13 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		if (this._compactionInFlight) {
+		while (this._compactionInFlight) {
 			// Preempt an in-flight compaction so a manual or extension compaction -
-			// possibly with custom instructions - takes over. Two concurrent
-			// compactions would both prepare from the same branch and append
-			// duplicate compaction entries.
+			// possibly with custom instructions - takes over. Re-check after waiting:
+			// multiple callers may wake from the same settled promise, but only one
+			// may claim the lock before the others wait on the new promise.
 			this.abortCompaction();
-			while (this._compactionInFlight) {
-				await this._compactionSettled;
-			}
+			await this._compactionSettled;
 		}
 		this._claimCompactionLock();
 
@@ -2229,10 +2232,10 @@ export class AgentSession {
 			return false;
 		}
 		this._claimCompactionLock();
-		const settings = this.getCompactionSettingsForModel();
 		let started = false;
 
 		try {
+			const settings = this.getCompactionSettingsForModel();
 			if (!this.model) {
 				return false;
 			}

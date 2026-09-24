@@ -346,6 +346,13 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await response.result();
+				// A provider can report an abort as an error when its signal checks race
+				// the abort. Once the run signal is aborted, an error stop reason is an
+				// abort artifact, not a provider failure - reclassify so cancellation is
+				// not surfaced, retried, or compacted as an error.
+				if (finalMessage.stopReason === "error" && signal?.aborted) {
+					finalMessage.stopReason = "aborted";
+				}
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {

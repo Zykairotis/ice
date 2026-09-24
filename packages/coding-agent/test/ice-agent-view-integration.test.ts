@@ -1021,7 +1021,7 @@ describe("ICE agent-view integration", () => {
 		expect(child.promptCalls).toHaveLength(3);
 	});
 
-	it("honors parent timeout while a child remains under control and releases the live session", async () => {
+	it("keeps a controlled child alive past the startup deadline until explicit cancellation", async () => {
 		const { cwd, agentDir } = await createWorkspace();
 		let startInitialTurn!: () => void;
 		const initialTurnStarted = new Promise<void>((resolve) => {
@@ -1032,6 +1032,7 @@ describe("ICE agent-view integration", () => {
 			releaseInitialTurn = resolve;
 		});
 		const child = new InteractiveChildSession(cwd, initialTurn, startInitialTurn);
+		const controller = new AbortController();
 		const registry = new SubagentLiveSessionRegistry();
 		const bridge = new IceAgentViewBridge();
 		bridge.setParentSession(passiveSession("parent", cwd));
@@ -1045,16 +1046,22 @@ describe("ICE agent-view integration", () => {
 		});
 		const runPromise = runner.runResolved(normalized, ["delegate", "read", "grep", "find", "ls"], {
 			model: { provider: "faux", id: "faux" } as Model<Api>,
+			signal: controller.signal,
+			noLifetimeTimeout: true,
 		});
 		await initialTurnStarted;
 		bridge.requestDisplay(normalized.runId);
 		expect(bridge.requestTakeControl()).toMatchObject({ accepted: true, mode: "controlled" });
 		releaseInitialTurn();
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		expect(child.abort).not.toHaveBeenCalled();
+		expect(registry.get(normalized.runId)).toBeDefined();
+		controller.abort();
 		const result = await runPromise;
-		expect(result).toMatchObject({ status: "timed_out", partial: true });
+		expect(result).toMatchObject({ status: "cancelled", partial: true });
 		expect(child.abort).toHaveBeenCalled();
 		expect(registry.get(normalized.runId)).toBeUndefined();
-		expect(bridge.getView(normalized.runId)).toMatchObject({ kind: "historical-subagent", status: "timed_out" });
+		expect(bridge.getView(normalized.runId)).toMatchObject({ kind: "historical-subagent", status: "cancelled" });
 	});
 
 	it("rejects malformed explicit final reports after steering instead of accepting conversational output", async () => {
@@ -1243,7 +1250,7 @@ describe("ICE agent-view integration", () => {
 		);
 	});
 
-	it("times out deterministically while the explicit finalization turn is pending", async () => {
+	it("does not time out while the explicit finalization turn is pending and cancels explicitly", async () => {
 		const { cwd, agentDir } = await createWorkspace();
 		let startInitialTurn!: () => void;
 		const initialTurnStarted = new Promise<void>((resolve) => {
@@ -1255,6 +1262,7 @@ describe("ICE agent-view integration", () => {
 		});
 		const neverFinalizes = new Promise<void>(() => {});
 		const child = new InteractiveChildSession(cwd, initialTurn, startInitialTurn, { wait: neverFinalizes });
+		const controller = new AbortController();
 		const registry = new SubagentLiveSessionRegistry();
 		const bridge = new IceAgentViewBridge();
 		bridge.setParentSession(passiveSession("parent", cwd));
@@ -1268,6 +1276,8 @@ describe("ICE agent-view integration", () => {
 		});
 		const runPromise = runner.runResolved(normalized, ["delegate", "read", "grep", "find", "ls"], {
 			model: { provider: "faux", id: "faux" } as Model<Api>,
+			signal: controller.signal,
+			noLifetimeTimeout: true,
 		});
 		await initialTurnStarted;
 		bridge.requestDisplay(normalized.runId);
@@ -1277,10 +1287,13 @@ describe("ICE agent-view integration", () => {
 		bridge.requestTakeControl();
 		await vi.waitFor(() => expect(child.promptCalls).toHaveLength(3));
 		expect(bridge.getView(normalized.runId)?.controlState).toBe("final-report-requested");
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		expect(child.abort).not.toHaveBeenCalled();
+		controller.abort();
 		const result = await runPromise;
-		expect(result).toMatchObject({ status: "timed_out", diagnostics: [{ code: "timeout" }] });
+		expect(result).toMatchObject({ status: "cancelled", diagnostics: [{ code: "cancellation" }] });
 		expect(child.abort).toHaveBeenCalled();
-		expect(bridge.getView(normalized.runId)).toMatchObject({ kind: "historical-subagent", status: "timed_out" });
+		expect(bridge.getView(normalized.runId)).toMatchObject({ kind: "historical-subagent", status: "cancelled" });
 	});
 
 	it("cancels deterministically while the explicit finalization turn is pending", async () => {

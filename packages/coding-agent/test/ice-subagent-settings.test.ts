@@ -47,6 +47,15 @@ describe("ICE subagent control settings", () => {
 		expect(() => parseIceSubagentSettings({ defaults: { maxTurns: 1 } })).toThrowError(/removed|maxTurns/i);
 		expect(() => parseIceSubagentSettings({ defaults: { maxToolCalls: 1 } })).toThrowError(/removed|maxToolCalls/i);
 		expect(() => parseIceSubagentSettings({ defaults: { maxTotalTokens: 1_023 } })).toThrowError(/maxTotalTokens/i);
+		expect(() => parseIceSubagentSettings({ defaults: { maxOutputBytes: 8_192 } })).toThrowError(
+			/removed.*host limits/i,
+		);
+		expect(() => parseIceSubagentSettings({ roleDefaults: { explore: { maxOutputBytes: 8_192 } } })).toThrowError(
+			/removed.*host limits/i,
+		);
+		expect(() => parseIceSubagentSettings({ restrictions: { maxOutputBytes: 8_192 } })).toThrowError(
+			/removed.*host limits/i,
+		);
 		expect(() => parseIceSubagentSettings({ restrictions: { maxTotalTokens: 1_000_001 } })).toThrowError(
 			/maxTotalTokens/i,
 		);
@@ -62,14 +71,25 @@ describe("ICE subagent control settings", () => {
 	it("parses bounded preferences and role overrides", () => {
 		const parsed = parseIceSubagentSettings({
 			enabled: true,
-			defaults: { thinking: "medium", timeoutMs: 60_000, maxOutputBytes: 8_192 },
+			defaults: {
+				thinking: "medium",
+				checkInIntervalMs: 180_000,
+				startupTimeoutMs: 60_000,
+			},
 			allowedRoles: ["explore"],
-			roleDefaults: { explore: { thinking: "low", maxOutputBytes: 4_096 } },
-			restrictions: { maxTimeoutMs: 90_000, denyRoles: ["bulk"] },
+			roleDefaults: { explore: { thinking: "low" } },
+			restrictions: { maxStartupTimeoutMs: 90_000, denyRoles: ["bulk"] },
 		});
 		expect(parsed.defaults.thinking).toBe("medium");
-		expect(parsed.roleDefaults.explore?.maxOutputBytes).toBe(4_096);
-		expect(parsed.restrictions.maxTimeoutMs).toBe(90_000);
+		expect(parsed.defaults.checkInIntervalMs).toBe(180_000);
+		expect(() => parseIceSubagentSettings({ defaults: { checkInIntervalMs: 119_999 } })).toThrowError(
+			/checkInIntervalMs/,
+		);
+		expect(parsed.defaults.startupTimeoutMs).toBe(60_000);
+		expect(() => parseIceSubagentSettings({ defaults: { timeoutMs: 60_000 } })).toThrowError(
+			/unknown preference key/,
+		);
+		expect(parsed.restrictions.maxStartupTimeoutMs).toBe(90_000);
 		expect(parsed.restrictions.denyRoles).toEqual(["bulk"]);
 		const sampling = parseIceSubagentSettings({ defaults: { temperature: 0.4, topP: 0.8 } });
 		expect(sampling.defaults).toMatchObject({ temperature: 0.4, topP: 0.8 });
@@ -79,19 +99,20 @@ describe("ICE subagent control settings", () => {
 		const contract = resolveIceSubagentContract({
 			role: "explore",
 			global: parseIceSubagentSettings({
-				defaults: { timeoutMs: 120_000 },
-				restrictions: { maxTimeoutMs: 16_000, denyRoles: ["bulk"] },
+				defaults: { startupTimeoutMs: 120_000 },
+				restrictions: { maxStartupTimeoutMs: 16_000, denyRoles: ["bulk"] },
 			}),
 			project: parseIceSubagentSettings({
-				defaults: { timeoutMs: 12_000 },
-				roleDefaults: { explore: { timeoutMs: 10_000 } },
+				defaults: { startupTimeoutMs: 12_000 },
+				roleDefaults: { explore: { startupTimeoutMs: 10_000 } },
 			}),
-			call: { timeoutMs: 14_000 },
+			call: { checkInIntervalMs: 240_000, startupTimeoutMs: 14_000 },
 		});
 		// Explicit call value wins within the deny-first ceiling of 16 seconds.
 		expect(contract.timeoutMs.value).toBe(14_000);
 		expect(contract.timeoutMs.source).toBe("call");
 		expect(contract.values.timeoutMs).toBe(14_000);
+		expect(contract.checkInIntervalMs).toMatchObject({ value: 240_000, source: "call" });
 		const deniedRole = resolveIceSubagentContract({
 			role: "bulk",
 			global: parseIceSubagentSettings({ restrictions: { denyRoles: ["bulk"] } }),
@@ -119,8 +140,8 @@ describe("ICE subagent control settings", () => {
 		const contract = resolveIceSubagentContract({
 			role: "explore",
 			globalFirst: false,
-			global: parseIceSubagentSettings({ defaults: { timeoutMs: 24_000 } }),
-			project: parseIceSubagentSettings({ defaults: { timeoutMs: 12_000 } }),
+			global: parseIceSubagentSettings({ defaults: { startupTimeoutMs: 24_000 } }),
+			project: parseIceSubagentSettings({ defaults: { startupTimeoutMs: 12_000 } }),
 		});
 		expect(contract.timeoutMs.value).toBe(12_000);
 		expect(contract.timeoutMs.source).toBe("project");
@@ -130,11 +151,11 @@ describe("ICE subagent control settings", () => {
 		const contract = resolveIceSubagentContract({
 			role: "explore",
 			global: parseIceSubagentSettings({
-				roleDefaults: { explore: { timeoutMs: 20_000 } },
+				roleDefaults: { explore: { startupTimeoutMs: 20_000 } },
 			}),
 			project: parseIceSubagentSettings({
-				defaults: { timeoutMs: 12_000 },
-				roleDefaults: { explore: { timeoutMs: 10_000 } },
+				defaults: { startupTimeoutMs: 12_000 },
+				roleDefaults: { explore: { startupTimeoutMs: 10_000 } },
 			}),
 		});
 		expect(contract.timeoutMs.value).toBe(20_000);
@@ -142,7 +163,7 @@ describe("ICE subagent control settings", () => {
 		const fallback = resolveIceSubagentContract({
 			role: "explore",
 			global: parseIceSubagentSettings(undefined),
-			project: parseIceSubagentSettings({ defaults: { timeoutMs: 12_000 } }),
+			project: parseIceSubagentSettings({ defaults: { startupTimeoutMs: 12_000 } }),
 		});
 		expect(fallback.timeoutMs.value).toBe(12_000);
 		expect(fallback.timeoutMs.source).toBe("project");
@@ -213,12 +234,17 @@ describe("ICE subagent control settings", () => {
 		const manager = SettingsManager.inMemory();
 		expect(manager.getIceSettingsValue("global")).toBeUndefined();
 		manager.setIceSettingsValue("global", {
-			subagents: { defaults: { timeoutMs: 9 } },
+			subagents: { defaults: { startupTimeoutMs: 9 } },
 		} as never);
 		expect(manager.getIceSettingsValue("global")?.subagents).toMatchObject({
-			defaults: { timeoutMs: 9 },
+			defaults: { startupTimeoutMs: 9 },
 		});
-		expect(parseIceSettings({ subagents: { defaults: { timeoutMs: 9 } } }).subagents.defaults.timeoutMs).toBe(9);
+		expect(
+			parseIceSettings({ subagents: { defaults: { startupTimeoutMs: 9 } } }).subagents.defaults.startupTimeoutMs,
+		).toBe(9);
+		expect(() => parseIceSettings({ subagents: { defaults: { timeoutMs: 9 } } })).toThrowError(
+			/unknown preference key/,
+		);
 		expect(() => parseIceSettings({ subagents: { defaults: { maxTurns: 1 } } })).toThrowError(/removed|maxTurns/i);
 	});
 
@@ -229,8 +255,8 @@ describe("ICE subagent control settings", () => {
 			const settingsManager = SettingsManager.inMemory({
 				ice: {
 					subagents: {
-						defaults: { timeoutMs: 8, maxOutputBytes: 8_192 },
-						restrictions: { maxTimeoutMs: 5, denyTools: ["grep"] },
+						defaults: { checkInIntervalMs: 240_000, startupTimeoutMs: 8 },
+						restrictions: { maxStartupTimeoutMs: 5, denyTools: ["grep"] },
 					},
 				},
 			});
@@ -241,14 +267,15 @@ describe("ICE subagent control settings", () => {
 					task: "Inspect the source.",
 					scope: { roots: ["src"] },
 					timeoutMs: 8,
-					execution: { maxOutputBytes: 8_192, tools: ["read", "grep"] },
+					execution: { tools: ["read", "grep"] },
 					cwd,
 				},
 				cwd,
 				{ projectTrusted: true, settingsManager },
 			);
 			expect(normalized.timeoutMs).toBe(5);
-			expect(normalized.execution.maxOutputBytes).toBe(8_192);
+			expect(normalized.checkInIntervalMs).toBe(240_000);
+			expect(normalized.execution).not.toHaveProperty("maxOutputBytes");
 			expect(normalized.execution.tools).toEqual(["read", "grep"]);
 			expect(normalized.deniedTools).toEqual(["grep"]);
 			expect(normalized.iceContract.sources.timeoutMs).toBe("enforced");

@@ -153,17 +153,14 @@ function effectiveIceValue(settings: SettingsManager, key: string, fallback: Rpc
 			role: "__ice_defaults__",
 			bundledDefaults: {
 				thinking: "medium",
-				timeoutMs: 120_000,
-				maxOutputBytes: 24_576,
+				startupTimeoutMs: 120_000,
 			},
 		});
 		switch (key) {
 			case "ice.subagents.defaults.thinking":
 				return contract.values.thinking;
-			case "ice.subagents.defaults.timeoutMs":
+			case "ice.subagents.defaults.startupTimeoutMs":
 				return contract.values.timeoutMs;
-			case "ice.subagents.defaults.maxOutputBytes":
-				return contract.values.maxOutputBytes;
 			case "ice.subagents.allowedRoles":
 				return contract.allowedRoles.value ? [...contract.allowedRoles.value] : [];
 			default:
@@ -251,28 +248,16 @@ const ICE_SETTINGS: RpcSettingsDefinition[] = [
 		read: (settings) => effectiveIceValue(settings, "ice.subagents.defaults.thinking", "medium") as string,
 	}),
 	iceSetting({
-		key: "ice.subagents.defaults.timeoutMs",
-		label: "Subagent timeout",
-		description: "Default bounded child execution timeout in milliseconds",
+		key: "ice.subagents.defaults.startupTimeoutMs",
+		label: "Subagent startup timeout",
+		description: "Maximum time to start a child session, in milliseconds; does not limit child execution time",
 		group: "ICE · Subagents",
 		kind: "number",
 		scope: "both",
 		defaultValue: 120_000,
 		constraints: { min: 1, max: 600_000, integer: true },
 		restartRequired: false,
-		read: (settings) => effectiveIceValue(settings, "ice.subagents.defaults.timeoutMs", 120_000) as number,
-	}),
-	iceSetting({
-		key: "ice.subagents.defaults.maxOutputBytes",
-		label: "Subagent result size cap",
-		description: "Default complete parent-facing result size cap in UTF-8 bytes; this is not model tokens or cost",
-		group: "ICE · Subagents",
-		kind: "number",
-		scope: "both",
-		defaultValue: 24_576,
-		constraints: { min: 1_024, max: 65_536, integer: true },
-		restartRequired: false,
-		read: (settings) => effectiveIceValue(settings, "ice.subagents.defaults.maxOutputBytes", 24_576) as number,
+		read: (settings) => effectiveIceValue(settings, "ice.subagents.defaults.startupTimeoutMs", 120_000) as number,
 	}),
 	iceSetting({
 		key: "ice.subagents.allowedRoles",

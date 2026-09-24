@@ -163,6 +163,33 @@ describe("subagent observatory reducer", () => {
 		});
 	});
 
+	it("projects check-in delivery independently from execution status and preserves it across progress", () => {
+		const store = new SubagentObservatoryStore();
+		const started = store.applyRuntime(runtimeEvent("subagent_started", "running", { nowMs: 1_100 }));
+		expect(started).toMatchObject({ status: "running", terminal: false });
+
+		const checkIn = {
+			delivery: "owner_unavailable" as const,
+			sequence: 1,
+			pendingSince: 121_100,
+			nextDueAt: undefined,
+		};
+		expect(store.updateCheckInState("run-1", checkIn)).toBe(true);
+		expect(store.getState().active[0]).toMatchObject({
+			status: "running",
+			terminal: false,
+			checkIn: { delivery: "owner_unavailable", sequence: 1 },
+		});
+		expect(formatProgressSnapshot(store.getState().active[0]!)).toContain("check-in overdue; owner unavailable");
+
+		const progress = store.applyRuntime(
+			runtimeEvent("subagent_tool_start", "running", { nowMs: 121_200, event: { toolName: "read" } }),
+		);
+		expect(progress).toMatchObject({ status: "running", terminal: false, checkIn });
+		expect(store.updateCheckInState("run-1", undefined)).toBe(true);
+		expect(store.getState().active[0]).not.toHaveProperty("checkIn");
+	});
+
 	it("projects child compaction and resumes the prior activity phase", () => {
 		let state = createObservatoryState();
 		state = apply(state, runtimeEvent("subagent_started", "running", { nowMs: 1_100 }));
@@ -514,14 +541,13 @@ describe("subagent observatory reducer", () => {
 		const projected = projectDurableSubagentJob({
 			...source,
 			job: { ...source.job, role: "explore\nrow", model: "faux\tmodel", resultRef: "job:job-secret\nrow" },
-			budget: { ...source.budget!, ownerActiveJobs: 2, ownerQueuedJobs: 3, ownerActiveJobsCap: 4 },
+			scheduling: { ownerActiveJobs: 2, ownerQueuedJobs: 3, ownerActiveJobsCap: 4 },
 		});
 		expect(projected).toMatchObject({
 			jobId: "job-secret",
 			status: "completed",
 			role: "explore row",
 			model: "faux model",
-			plannedOutputBytes: 24 * 1024,
 			ownerActiveJobs: 2,
 			ownerQueuedJobs: 3,
 			ownerActiveJobsCap: 4,

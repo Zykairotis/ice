@@ -181,6 +181,7 @@ describe("ICE M10/M11 delegate integration", () => {
 					context: "selected parent note",
 					contextPacket: { items: [{ id: "fact", kind: "verified_fact", content: "selected fact" }] },
 					outputSchema: { type: "object", additionalProperties: false },
+					background: false,
 				}),
 				undefined,
 				undefined,
@@ -235,6 +236,7 @@ describe("ICE M10/M11 delegate integration", () => {
 					role: "self",
 					self: { instructions: "Review the scoped evidence without modifying files." },
 					outputSchema: { type: "object", additionalProperties: false },
+					background: false,
 				}),
 				undefined,
 				undefined,
@@ -267,7 +269,13 @@ describe("ICE M10/M11 delegate integration", () => {
 		const controller = new AbortController();
 		const call = harness.tools
 			.get("delegate")!
-			.execute("delegate-cancel", delegateParams(), controller.signal, undefined, harness.context);
+			.execute(
+				"delegate-cancel",
+				delegateParams({ background: false }),
+				controller.signal,
+				undefined,
+				harness.context,
+			);
 		await started;
 		controller.abort();
 		release(fauxAssistantMessage('{"summary":"cancelled","evidence":{"paths":["src"]}}'));
@@ -277,7 +285,7 @@ describe("ICE M10/M11 delegate integration", () => {
 		expect(harness.parentEntries).toHaveLength(0);
 	});
 
-	it("pauses a started child for an explicit extension decision instead of launching recovery", async () => {
+	it("keeps a started foreground child running beyond its startup bound", async () => {
 		vi.useFakeTimers();
 		try {
 			const harness = await createHarness();
@@ -295,43 +303,36 @@ describe("ICE M10/M11 delegate integration", () => {
 			const started = new Promise<void>((resolve) => {
 				startedResolve = resolve;
 			});
+			let settled = false;
 			const resultPromise = harness.tools
 				.get("delegate")!
-				.execute("delegate-timeout", delegateParams({ timeoutMs: 10 }), undefined, undefined, harness.context);
+				.execute(
+					"delegate-no-lifetime",
+					delegateParams({ startupTimeoutMs: 10, background: false }),
+					undefined,
+					undefined,
+					harness.context,
+				)
+				.then((value) => {
+					settled = true;
+					return value;
+				});
 			await started;
-			await vi.advanceTimersByTimeAsync(10);
-			release(fauxAssistantMessage('{"summary":"timed out","evidence":{"paths":["src"]}}'));
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(settled).toBe(false);
+			release(
+				fauxAssistantMessage('{"summary":"completed after startup","evidence":{"paths":["src"]},"payload":{}}'),
+			);
 			const result = resultOf(await resultPromise);
 			expect(result.isError).toBe(false);
-			const child = result.details!.result as { status: string; runId: string };
-			expect(child.status).toBe("needs_time");
-			expect(result.content[0]!.text).toMatch(/needs_time|runtime attention|remaining extendable/i);
-			const inspected = resultOf(
-				await harness.tools
-					.get("manage_subagent")!
-					.execute(
-						"inspect-timeout",
-						{ runId: child.runId, action: "inspect" },
-						undefined,
-						undefined,
-						harness.context,
-					),
-			);
-			expect(inspected.isError).toBe(false);
-			expect(inspected.content[0]!.text).toMatch(/Runtime attention|Remaining extendable/i);
-			const stopped = resultOf(
-				await harness.tools
-					.get("manage_subagent")!
-					.execute("stop-timeout", { runId: child.runId, action: "stop" }, undefined, undefined, harness.context),
-			);
-			expect(stopped.isError).toBe(false);
-			expect(stopped.content[0]!.text).toMatch(/Stopped retained subagent|cancelled/i);
+			expect(result.details!.result).toMatchObject({ status: "completed" });
+			expect(result.content[0]!.text).toMatch(/completed/i);
 		} finally {
 			vi.useRealTimers();
 		}
 	});
 
-	it("keeps a durable async child retained at its requested timeout until the parent decides", async () => {
+	it("keeps a durable async child running beyond its startup bound until it completes", async () => {
 		vi.useFakeTimers();
 		try {
 			const harness = await createHarness();
@@ -353,8 +354,8 @@ describe("ICE M10/M11 delegate integration", () => {
 				await harness.tools
 					.get("delegate_async")!
 					.execute(
-						"delegate-async-timeout",
-						delegateParams({ timeoutMs: 10 }),
+						"delegate-async-no-lifetime",
+						delegateParams({ startupTimeoutMs: 10 }),
 						undefined,
 						undefined,
 						harness.context,
@@ -363,37 +364,25 @@ describe("ICE M10/M11 delegate integration", () => {
 			const jobId = (accepted.details!.accepted as { jobId: string }).jobId;
 			expect(accepted.isError).toBe(false);
 			await started;
-			await vi.advanceTimersByTimeAsync(10);
-			release(fauxAssistantMessage('{"summary":"timed out","evidence":{"paths":["src"]}}'));
-			for (let index = 0; index < 4; index++) await vi.advanceTimersByTimeAsync(0);
-			const inspection = resultOf(
+			await vi.advanceTimersByTimeAsync(10_000);
+			const runningInspection = resultOf(
 				await harness.tools
 					.get("inspect_subagent_job")!
-					.execute("inspect-async-timeout", { jobId }, undefined, undefined, harness.context),
+					.execute("inspect-async-running", { jobId }, undefined, undefined, harness.context),
 			);
-			const job = (inspection.details!.inspection as { job: { status: string; runId?: string } }).job;
-			expect(job.status).toBe("needs_time");
-			expect(job.runId).toEqual(expect.any(String));
-			expect(inspection.content[0]!.text).toMatch(/same child run is retained|manage_subagent/i);
-			const stopped = resultOf(
-				await harness.tools
-					.get("manage_subagent")!
-					.execute(
-						"stop-async-timeout",
-						{ runId: job.runId, action: "stop" },
-						undefined,
-						undefined,
-						harness.context,
-					),
+			const runningJob = (runningInspection.details!.inspection as { job: { status: string; runId?: string } }).job;
+			expect(runningJob.status).toBe("running");
+
+			release(
+				fauxAssistantMessage('{"summary":"completed after startup","evidence":{"paths":["src"]},"payload":{}}'),
 			);
-			expect(stopped.isError).toBe(false);
-			for (let index = 0; index < 4; index++) await vi.advanceTimersByTimeAsync(0);
+			for (let index = 0; index < 6; index++) await vi.advanceTimersByTimeAsync(0);
 			const settled = resultOf(
 				await harness.tools
 					.get("inspect_subagent_job")!
-					.execute("inspect-async-stopped", { jobId }, undefined, undefined, harness.context),
+					.execute("inspect-async-completed", { jobId }, undefined, undefined, harness.context),
 			);
-			expect((settled.details!.inspection as { job: { status: string } }).job.status).toBe("cancelled");
+			expect((settled.details!.inspection as { job: { status: string } }).job.status).toBe("completed");
 		} finally {
 			vi.useRealTimers();
 		}

@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@zykairotis/ice-agent-core";
 import type { AgentSession } from "./core/agent-session.ts";
+import type { SubagentCheckInState } from "./ice-subagent-checkin.ts";
 import type { SubagentRetryState, SubagentRuntimeAttention } from "./ice-subagent-timeout-supervisor.ts";
 import { redactCredentialText } from "./utils/redact.ts";
 
@@ -41,7 +42,6 @@ export interface IceAgentViewPresentation {
 	readonly authority?: IceAgentViewAuthority;
 	readonly handoffMessageMarker?: string;
 	readonly finalizationMessageMarker?: string;
-	readonly timeoutContinuationMessageMarker?: string;
 	/** Marker for the internal timeout wrap-up prompt; hidden from child views. */
 	readonly wrapUpMessageMarker?: string;
 	readonly handoffMessageIndex?: number;
@@ -67,7 +67,6 @@ export type IceAgentViewPresentationPatch = IceAgentViewPresentation;
 export type IceAgentViewInteractionMode = "mirror" | "controlled";
 export type IceAgentViewControlState =
 	| "working"
-	| "awaiting-extension"
 	| "awaiting-finalization"
 	| "final-report-requested"
 	| "final-report-received"
@@ -85,12 +84,9 @@ export interface IceAgentViewLiveSessionControl {
 	readonly requestFinalReport: () => boolean;
 	readonly markFinalReportReceived: () => boolean;
 	readonly markTerminal: () => void;
-	/** Runtime timeout controls are optional for non-supervised display sessions. */
+	/** Runtime observation/stop controls are optional for non-supervised display sessions. */
 	readonly getRuntimeAttention?: () => SubagentRuntimeAttention | undefined;
-	readonly extendRuntime?: (additionalMs: number) => Promise<unknown>;
 	readonly stopRuntime?: () => Promise<unknown>;
-	readonly markAwaitingExtension?: () => boolean;
-	readonly resumeFromExtension?: () => boolean;
 	/** Parent-owned queued follow-up; rejected while a user has takeover control. */
 	readonly followUp?: (text: string) => Promise<void>;
 	readonly steer: (text: string) => Promise<void>;
@@ -121,6 +117,7 @@ export interface IceAgentViewDescriptor {
 	readonly startedAt?: number;
 	readonly finishedAt?: number;
 	readonly presentation?: IceAgentViewPresentation;
+	readonly checkIn?: SubagentCheckInState;
 	readonly messages?: readonly AgentMessage[];
 }
 
@@ -132,6 +129,7 @@ export interface IceAgentViewLiveSession {
 	readonly authority?: IceAgentViewAuthority;
 	readonly color?: IceAgentViewColor;
 	readonly presentation?: IceAgentViewPresentation;
+	readonly checkIn?: SubagentCheckInState;
 	readonly session: AgentSession;
 	readonly control?: IceAgentViewLiveSessionControl;
 }
@@ -272,7 +270,7 @@ function normalizeRuntimeAttention(input: unknown): SubagentRuntimeAttention | u
 	const state = input.state;
 	const phase = input.phase;
 	if (
-		(state !== "running" && state !== "awaiting_extension" && state !== "terminal") ||
+		(state !== "running" && state !== "terminal") ||
 		(phase !== "startup" &&
 			phase !== "working" &&
 			phase !== "wrapping_up" &&
@@ -281,23 +279,8 @@ function normalizeRuntimeAttention(input: unknown): SubagentRuntimeAttention | u
 	) {
 		return undefined;
 	}
-	const initialTimeoutMs = boundedRuntimeNumber(input.initialTimeoutMs);
-	const activeBudgetMs = boundedRuntimeNumber(input.activeBudgetMs);
 	const activeElapsedMs = boundedRuntimeNumber(input.activeElapsedMs);
-	const totalExtendedMs = boundedRuntimeNumber(input.totalExtendedMs);
-	const extensionCount = boundedRuntimeNumber(input.extensionCount);
-	const remainingExtendableMs = boundedRuntimeNumber(input.remainingExtendableMs);
-	const remainingRetentionMs = boundedRuntimeNumber(input.remainingRetentionMs);
-	if (
-		initialTimeoutMs === undefined ||
-		activeBudgetMs === undefined ||
-		activeElapsedMs === undefined ||
-		totalExtendedMs === undefined ||
-		extensionCount === undefined ||
-		remainingExtendableMs === undefined
-	) {
-		return undefined;
-	}
+	if (activeElapsedMs === undefined) return undefined;
 	const rawActivities = Array.isArray(input.lastActivities) ? input.lastActivities : [];
 	const lastActivities = rawActivities
 		.slice(-12)
@@ -380,20 +363,13 @@ function normalizeRuntimeAttention(input: unknown): SubagentRuntimeAttention | u
 		: undefined;
 	const progressAgeMs = boundedRuntimeNumber(input.progressAgeMs);
 	const lastProgressAtMs = boundedRuntimeNumber(input.lastProgressAtMs);
-	const decisionDeadlineAtMs = boundedRuntimeNumber(input.decisionDeadlineAtMs);
 	return deepFreezeSnapshot({
 		phase,
 		state,
-		initialTimeoutMs,
-		activeBudgetMs,
+		lifetimeDeadline: false,
 		activeElapsedMs,
-		totalExtendedMs,
-		extensionCount,
-		remainingExtendableMs,
-		...(remainingRetentionMs !== undefined ? { remainingRetentionMs } : {}),
 		...(progressAgeMs !== undefined ? { progressAgeMs } : {}),
 		...(lastProgressAtMs !== undefined ? { lastProgressAtMs } : {}),
-		...(decisionDeadlineAtMs !== undefined ? { decisionDeadlineAtMs } : {}),
 		lastActivities,
 		...(repeatedFailure ? { repeatedFailure } : {}),
 		...(usage ? { usage } : {}),
@@ -428,10 +404,6 @@ export function normalizeIceAgentViewPresentation(
 	const finalizationMessageMarker =
 		typeof input.finalizationMessageMarker === "string"
 			? truncatePresentationText(input.finalizationMessageMarker, MAX_PRESENTATION_LABEL_BYTES)
-			: undefined;
-	const timeoutContinuationMessageMarker =
-		typeof input.timeoutContinuationMessageMarker === "string"
-			? truncatePresentationText(input.timeoutContinuationMessageMarker, MAX_PRESENTATION_LABEL_BYTES)
 			: undefined;
 	const wrapUpMessageMarker =
 		typeof input.wrapUpMessageMarker === "string"
@@ -498,7 +470,6 @@ export function normalizeIceAgentViewPresentation(
 		...(authority ? { authority } : {}),
 		...(handoffMessageMarker ? { handoffMessageMarker } : {}),
 		...(finalizationMessageMarker ? { finalizationMessageMarker } : {}),
-		...(timeoutContinuationMessageMarker ? { timeoutContinuationMessageMarker } : {}),
 		...(wrapUpMessageMarker ? { wrapUpMessageMarker } : {}),
 		...(handoffMessageIndex !== undefined ? { handoffMessageIndex } : {}),
 		...(finalizationMessageIndex !== undefined ? { finalizationMessageIndex } : {}),
@@ -527,6 +498,10 @@ export class IceAgentViewBridge {
 	private readonly uiState = new Map<string, AgentViewUiState>();
 	private readonly interactionModes = new Map<string, IceAgentViewInteractionMode>();
 	private displayedId = "parent";
+
+	getParentSession(): AgentSession | undefined {
+		return this.parentSession;
+	}
 
 	setParentSession(session: AgentSession): void {
 		const replaced = this.parentSession !== undefined && this.parentSession !== session;
@@ -671,9 +646,9 @@ export class IceAgentViewBridge {
 				presentation: runtimeAttention
 					? normalizeIceAgentViewPresentation({ ...entry.presentation, runtimeAttention })
 					: entry.presentation,
+				...(entry.checkIn ? { checkIn: entry.checkIn } : {}),
 				model: entry.model,
-				status:
-					controlState === "awaiting-extension" ? "needs_time" : entry.session.isStreaming ? "working" : "idle",
+				status: entry.session.isStreaming ? "working" : "idle",
 				cwd: entry.session.sessionManager.getCwd(),
 			});
 		});
@@ -753,14 +728,6 @@ export class IceAgentViewBridge {
 	getRuntimeAttention(id: string): SubagentRuntimeAttention | undefined {
 		const entry = this.liveSource?.list().find((candidate) => candidate.runId === id);
 		return entry?.control?.getRuntimeAttention?.() ?? entry?.presentation?.runtimeAttention;
-	}
-
-	async extendRuntime(id: string, additionalMs: number): Promise<unknown> {
-		const entry = this.liveSource?.list().find((candidate) => candidate.runId === id);
-		if (!entry?.control?.extendRuntime) throw new Error("The selected subagent cannot be extended.");
-		const result = await entry.control.extendRuntime(additionalMs);
-		this.publish();
-		return result;
 	}
 
 	async stopRuntime(id: string): Promise<unknown> {

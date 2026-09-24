@@ -159,7 +159,11 @@ describe("production file/self delegation acceptance", () => {
 				return fauxAssistantMessage(success);
 			},
 		]);
-		const result = await h.call("delegate", { ...h.request, self: { instructions: "ADDITIONAL_TASK_GUIDANCE" } });
+		const result = await h.call("delegate", {
+			...h.request,
+			background: false,
+			self: { instructions: "ADDITIONAL_TASK_GUIDANCE" },
+		});
 		expect(result.isError).toBe(false);
 		expect(prompt).toContain("ACTUAL_PARENT_INSTRUCTIONS");
 		expect(prompt).toContain("ADDITIONAL_TASK_GUIDANCE");
@@ -183,7 +187,11 @@ describe("production file/self delegation acceptance", () => {
 			fauxAssistantMessage([fauxToolCall(subagentMcpToolName("docs/search"), { q: "query" })]),
 			fauxAssistantMessage(success),
 		]);
-		const result = await h.call("delegate", { ...h.request, self: { mcp: ["docs/search"] } });
+		const result = await h.call("delegate", {
+			...h.request,
+			background: false,
+			self: { mcp: ["docs/search"] },
+		});
 		expect(result.isError).toBe(false);
 		expect(dispatch).toHaveBeenCalledOnce();
 		expect(dispatch.mock.calls[0]?.slice(0, 3)).toEqual(["docs", "search", { q: "query" }]);
@@ -213,7 +221,12 @@ describe("production file/self delegation acceptance", () => {
 			fauxAssistantMessage([fauxToolCall(subagentMcpToolName("docs/search"), { q: "query" })]),
 			fauxAssistantMessage(success),
 		]);
-		await h.call("delegate", { ...h.request, self: { mcp: ["docs/search"] }, execution: { hooks: [] } });
+		await h.call("delegate", {
+			...h.request,
+			background: false,
+			self: { mcp: ["docs/search"] },
+			execution: { hooks: [] },
+		});
 		expect(gate).toHaveBeenCalledOnce();
 		expect(dispatch).not.toHaveBeenCalled();
 		expect(h.entries.some((entry) => JSON.stringify(entry).includes("mcp-gate"))).toBe(true);
@@ -250,7 +263,7 @@ describe("production file/self delegation acceptance", () => {
 			}),
 		);
 		h.faux.setResponses([fauxAssistantMessage([fauxToolCall("lookup", {})]), fauxAssistantMessage(success)]);
-		expect((await h.call("delegate", h.request)).isError).toBe(false);
+		expect((await h.call("delegate", { ...h.request, background: false })).isError).toBe(false);
 		expect(execute).toHaveBeenCalledOnce();
 		h.setActive(["delegate", "read"]);
 		expect((await h.call("delegate", { ...h.request, self: { capabilities: ["lookup"] } })).isError).toBe(true);
@@ -281,7 +294,7 @@ describe("production file/self delegation acceptance", () => {
 			if (selected.length === 1) return startupFailure(request);
 			return original.call(this, request, tools, options);
 		});
-		const result = await h.call("delegate", { ...h.request, role: "pair" });
+		const result = await h.call("delegate", { ...h.request, role: "pair", background: false });
 		expect(selected).toEqual(["primary", "fallback"]);
 		expect(result.isError).toBe(false);
 		expect(result.details.launch.model).toContain("fallback");
