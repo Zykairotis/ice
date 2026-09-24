@@ -63,7 +63,14 @@ function completedResult(task: ResolvedSubagentBatchTask, overrides: Partial<Sub
 		source: task.request.profile.source,
 		status: "completed",
 		summary: "Observed scoped evidence.",
-		observedOutputBytes: 24,
+		output: {
+			text: "Observed scoped evidence.",
+			textBytes: Buffer.byteLength("Observed scoped evidence."),
+			originalBytes: Buffer.byteLength("Observed scoped evidence."),
+			inlineTruncated: false,
+			captureStatus: "inline_complete",
+		},
+		observedOutputBytes: Buffer.byteLength("Observed scoped evidence."),
 		partial: false,
 		diagnostics: [],
 		evidence: { paths: ["src"] },
@@ -272,7 +279,7 @@ describe("ICE B8.1 deterministic adversarial invariants", () => {
 		expect(result.diagnostics[0]?.code).toBe("timeout");
 	});
 
-	it("budget.concurrent-retry-contention never exceeds aggregate authority", async () => {
+	it("concurrent startup retries remain bounded to two attempts each", async () => {
 		const cwd = await createWorkspace();
 		const tasks = [resolvedTask(cwd, "one"), resolvedTask(cwd, "two")];
 		let calls = 0;
@@ -292,10 +299,10 @@ describe("ICE B8.1 deterministic adversarial invariants", () => {
 					};
 				},
 			},
-			{ concurrency: 2, totalBudgetBytes: tasks[0]!.request.maxOutputBytes * 2 },
+			{ concurrency: 2 },
 		);
-		expect(calls).toBeLessThanOrEqual(4);
-		expect(result.budget.consumed).toBeLessThanOrEqual(result.budget.total);
+		expect(calls).toBe(4);
+		expect(result).not.toHaveProperty("budget");
 	});
 
 	it("verification.invalid-evidence-valid-json rejects evidence outside the approved scope", async () => {

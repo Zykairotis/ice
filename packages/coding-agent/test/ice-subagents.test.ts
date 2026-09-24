@@ -33,6 +33,7 @@ import { IceAgentViewBridge } from "../src/ice-agent-view-bridge.ts";
 import { getIceDelegableTools, registerIceDelegableTool } from "../src/ice-subagent-capabilities.ts";
 import { JOB_COMPLETION_MESSAGE_TYPE, JOB_ENTRY_TYPE, SubagentJobRegistry } from "../src/ice-subagent-jobs.ts";
 import { getProgressSnapshot } from "../src/ice-subagent-observatory.ts";
+import { SubagentOutputArtifactStore } from "../src/ice-subagent-output-artifacts.ts";
 import { ICE_HOOK_JOURNAL_ENTRY_TYPE, type IceHookHandler } from "../src/ice-subagent-settings.ts";
 import { SubagentRunSupervisorRegistry } from "../src/ice-subagent-timeout-supervisor.ts";
 import * as iceSubagentsModule from "../src/ice-subagents.ts";
@@ -176,6 +177,35 @@ type AsyncToolHarnessOptions = {
 	settingsManager?: SettingsManager;
 	trusted?: boolean;
 };
+
+type ManagedToolLike = { execute: (...args: unknown[]) => Promise<unknown> };
+type SettledToolResult = { isError: boolean; content: Array<{ text: string }>; details: Record<string, unknown> };
+
+/** Delegate always returns a managed handle; wait for the terminal presentation and merge it with the launch. */
+async function settleManagedDelegate(
+	tools: ReadonlyMap<string, ManagedToolLike>,
+	context: ExtensionContext,
+	launched: unknown,
+): Promise<SettledToolResult> {
+	const launch = launched as SettledToolResult;
+	const managed = launch.details?.managed as { runId: string } | undefined;
+	if (!managed) return launch;
+	const waited = (await tools
+		.get("manage_subagent")!
+		.execute(
+			"settle-managed",
+			{ action: "wait", runId: managed.runId, waitMs: 60_000 },
+			undefined,
+			undefined,
+			context,
+		)) as SettledToolResult;
+	const observation = waited.details.observation as { result?: SubagentResult } | undefined;
+	return {
+		isError: waited.isError || observation?.result?.status !== "completed",
+		content: waited.content,
+		details: { ...launch.details, ...waited.details, result: observation?.result },
+	};
+}
 
 async function createAsyncToolHarness(options: AsyncToolHarnessOptions = {}) {
 	const cwd = await createWorkspace();
@@ -397,7 +427,14 @@ function verificationFixture(cwd: string, role: "self" | "review" = "self") {
 		source: normalized.profile.source,
 		status: "completed",
 		summary: "Observed the requested implementation fact.",
-		observedOutputBytes: 48,
+		output: {
+			text: "Observed the requested implementation fact.",
+			textBytes: Buffer.byteLength("Observed the requested implementation fact."),
+			originalBytes: Buffer.byteLength("Observed the requested implementation fact."),
+			inlineTruncated: false,
+			captureStatus: "inline_complete",
+		},
+		observedOutputBytes: Buffer.byteLength("Observed the requested implementation fact."),
 		partial: false,
 		diagnostics: [],
 		evidence: { paths: ["src"] },
@@ -501,6 +538,17 @@ function batchResult(
 		source: task.request.profile.source,
 		status,
 		summary,
+		...(status === "completed"
+			? {
+					output: {
+						text: summary,
+						textBytes: Buffer.byteLength(summary),
+						originalBytes: Buffer.byteLength(summary),
+						inlineTruncated: false,
+						captureStatus: "inline_complete" as const,
+					},
+				}
+			: {}),
 		observedOutputBytes: Buffer.byteLength(summary),
 		partial: status !== "completed",
 		diagnostics:
@@ -654,11 +702,11 @@ describe("ICE subagent contracts", () => {
 		const harness = await createAsyncToolHarness();
 		const schema = harness.tools.get("manage_subagent")!.parameters;
 		expect(schema).toMatchObject({ additionalProperties: false });
-		// The combined lifecycle exposes live-multiplexing actions (peek/wait/detach)
-		// alongside terminal reuse/delete actions in one phase-aware union.
-		for (const action of ["inspect", "peek", "wait", "extend", "follow_up", "stop", "detach", "resume", "delete"]) {
+		// The combined lifecycle exposes observation/control actions alongside terminal reuse/delete actions.
+		for (const action of ["inspect", "peek", "wait", "follow_up", "stop", "detach", "resume", "delete"]) {
 			expect(Value.Check(schema, { runId: "run-1", action })).toBe(true);
 		}
+		expect(Value.Check(schema, { runId: "run-1", action: "extend", additionalMs: 60_000 })).toBe(false);
 		// An action outside the closed union is rejected outright.
 		expect(Value.Check(schema, { runId: "run-1", action: "recreate" })).toBe(false);
 		// Widening fields are undeclared, and the closed object rejects them at the boundary.
@@ -711,6 +759,334 @@ describe("ICE subagent contracts", () => {
 		expect(inspected.content?.[0]?.text).toMatch(/foreground runId.*batchId.*taskId/i);
 	});
 
+	it("accepts isolated writers after preflight and exposes their retained result through manage_subagent", async () => {
+		const workspace = await createGitWorkspace();
+		const harness = await createAsyncToolHarness({
+			activeTools: ["delegate_write", "read", "write", "edit", "grep", "find", "ls"],
+		});
+		const previousAgentDir = process.env.ICE_CODING_AGENT_DIR;
+		const agentDir = await mkdtemp(join(tmpdir(), "ice-subagent-writer-agent-"));
+		tempDirs.push(agentDir);
+		process.env.ICE_CODING_AGENT_DIR = agentDir;
+		(harness.context as unknown as { cwd: string }).cwd = workspace.cwd;
+		const delegateWrite = harness.tools.get("delegate_write")!;
+		const manage = harness.tools.get("manage_subagent")!;
+		try {
+			harness.faux.setResponses([fauxAssistantMessage("Writer completed without changing files.")]);
+			const accepted = await delegateWrite.execute(
+				"writer-background",
+				{
+					task: "Inspect the scoped source and report completion.",
+					baseCommit: workspace.head,
+					scope: { roots: ["src"] },
+				},
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(accepted).toMatchObject({
+				isError: false,
+				details: {
+					accepted: { runId: expect.any(String), baseCommit: workspace.head, workspaceIsolation: "worktree" },
+				},
+			});
+			const runId = accepted.details.accepted.runId as string;
+			await vi.waitFor(
+				async () => {
+					const inspection = await manage.execute(
+						"writer-inspect-terminal",
+						{ runId, action: "inspect" },
+						undefined,
+						undefined,
+						harness.context,
+					);
+					expect(inspection.details.writer).toMatchObject({
+						state: "completed",
+						result: { status: "completed", workspaceIsolation: "worktree", workspaceRemoved: true },
+					});
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+
+			const rejected = await delegateWrite.execute(
+				"writer-preflight-rejected",
+				{ task: "Must not be admitted.", baseCommit: "0".repeat(40), scope: { roots: ["src"] } },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(rejected).toMatchObject({ isError: true, details: { result: { status: "failed" } } });
+			expect(rejected.details).not.toHaveProperty("accepted");
+		} finally {
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+			if (previousAgentDir === undefined) delete process.env.ICE_CODING_AGENT_DIR;
+			else process.env.ICE_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("stops an admitted background writer and waits for isolated-worktree cleanup", async () => {
+		const workspace = await createGitWorkspace();
+		const harness = await createAsyncToolHarness({
+			activeTools: ["delegate_write", "read", "write", "edit", "grep", "find", "ls"],
+		});
+		const previousAgentDir = process.env.ICE_CODING_AGENT_DIR;
+		const agentDir = await mkdtemp(join(tmpdir(), "ice-subagent-writer-stop-agent-"));
+		tempDirs.push(agentDir);
+		process.env.ICE_CODING_AGENT_DIR = agentDir;
+		(harness.context as unknown as { cwd: string }).cwd = workspace.cwd;
+		let releaseWriter!: () => void;
+		let markWriterStarted!: () => void;
+		const blockedWriter = new Promise<void>((resolve) => {
+			releaseWriter = resolve;
+		});
+		const writerStarted = new Promise<void>((resolve) => {
+			markWriterStarted = resolve;
+		});
+		try {
+			harness.faux.setResponses([
+				async () => {
+					markWriterStarted();
+					await blockedWriter;
+					return fauxAssistantMessage("Writer stopped after admission.");
+				},
+			]);
+			const accepted = await harness.tools.get("delegate_write")!.execute(
+				"writer-stop-launch",
+				{
+					task: "Inspect the scoped source and report completion.",
+					baseCommit: workspace.head,
+					scope: { roots: ["src"] },
+				},
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(accepted).toMatchObject({ isError: false, details: { accepted: { runId: expect.any(String) } } });
+			const runId = accepted.details.accepted.runId as string;
+			await writerStarted;
+			const stopping = harness.tools
+				.get("manage_subagent")!
+				.execute("writer-stop", { runId, action: "stop" }, undefined, undefined, harness.context);
+			releaseWriter();
+			const stopped = await stopping;
+			expect(stopped).toMatchObject({
+				isError: false,
+				details: {
+					writer: {
+						state: "cancelled",
+						result: { status: "cancelled", workspaceIsolation: "worktree", workspaceRemoved: true },
+					},
+				},
+			});
+			expect(await git(workspace.cwd, "status", "--porcelain=v1", "-uall")).toBe("");
+		} finally {
+			releaseWriter();
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+			if (previousAgentDir === undefined) delete process.env.ICE_CODING_AGENT_DIR;
+			else process.env.ICE_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
+	it("returns inspectable owner-scoped handles for background batches and reviews", async () => {
+		const harness = await createAsyncToolHarness();
+		const instruction = "Inspect the approved scope and return a concise structured report.";
+		const response = fauxAssistantMessage('{"summary":"Inspected src.","evidence":{"paths":["src"]},"findings":[]}');
+		const inspect = harness.tools.get("inspect_subagent_batch")!;
+		const launchBatch = async (toolName: "delegate_batch" | "review_batch", params: Record<string, unknown>) => {
+			const accepted = await harness.tools
+				.get(toolName)!
+				.execute(`launch-${toolName}`, params as never, undefined, undefined, harness.context);
+			expect(accepted).toMatchObject({ isError: false, details: { accepted: { batchId: expect.any(String) } } });
+			const batchId = accepted.details.accepted.batchId as string;
+			await vi.waitFor(
+				async () => {
+					const inspection = await inspect.execute(
+						`inspect-${toolName}`,
+						{ batchId },
+						undefined,
+						undefined,
+						harness.context,
+					);
+					expect(inspection.details.inspection.result).toBeDefined();
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			const inspection = await inspect.execute(
+				`inspect-${toolName}-final`,
+				{ batchId },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			return inspection.details.inspection.result;
+		};
+
+		try {
+			harness.faux.setResponses([response, response, response, response]);
+			const batch = await launchBatch("delegate_batch", {
+				tasks: ["first", "second"].map((id) => ({
+					id,
+					role: "self",
+					self: { instructions: instruction, capabilities: ["read", "grep", "find", "ls"] },
+					task: "Inspect the source tree.",
+					scope: { roots: ["src"] },
+				})),
+			});
+			expect((batch as { items: Array<{ taskId: string }> }).items.map((item) => item.taskId)).toEqual([
+				"first",
+				"second",
+			]);
+
+			const review = await launchBatch("review_batch", {
+				tasks: ["correctness", "security"].map((dimension, index) => ({
+					id: `review-${index}`,
+					dimension,
+					task: `Review ${dimension}.`,
+					scope: { roots: ["src"] },
+				})),
+			});
+			expect((review as { reviewers: Array<{ taskId: string }> }).reviewers.map((item) => item.taskId)).toEqual([
+				"review-0",
+				"review-1",
+			]);
+		} finally {
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
+	it("keeps the parent available while accepted batch children are still running", async () => {
+		const harness = await createAsyncToolHarness();
+		let releaseBlockedChild!: () => void;
+		let markChildStarted!: () => void;
+		const blockedChild = new Promise<void>((resolve) => {
+			releaseBlockedChild = resolve;
+		});
+		const childStarted = new Promise<void>((resolve) => {
+			markChildStarted = resolve;
+		});
+		const instruction = "Inspect the approved scope and return a concise structured report.";
+		try {
+			harness.faux.setResponses([
+				async () => {
+					markChildStarted();
+					await blockedChild;
+					return fauxAssistantMessage("Delayed child completed.");
+				},
+				fauxAssistantMessage("Sibling completed."),
+			]);
+			const accepted = await harness.tools.get("delegate_batch")!.execute(
+				"batch-background-prompt",
+				{
+					tasks: ["delayed", "sibling"].map((id) => ({
+						id,
+						role: "self",
+						self: { instructions: instruction, capabilities: ["read", "grep", "find", "ls"] },
+						task: "Inspect the source tree.",
+						scope: { roots: ["src"] },
+					})),
+				},
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(accepted).toMatchObject({ isError: false, details: { accepted: { batchId: expect.any(String) } } });
+			const batchId = accepted.details.accepted.batchId as string;
+			await childStarted;
+			const inspection = await harness.tools
+				.get("inspect_subagent_batch")!
+				.execute("batch-background-inspect", { batchId }, undefined, undefined, harness.context);
+			expect(inspection.details.inspection.result).toBeUndefined();
+			expect(inspection.details.inspection.tasks.map((task: { status: string }) => task.status)).toContain(
+				"running",
+			);
+			expect(
+				inspection.details.inspection.tasks.some(
+					(task: { checkIn?: { delivery: string } }) => task.checkIn?.delivery === "armed",
+				),
+			).toBe(true);
+			releaseBlockedChild();
+			await vi.waitFor(
+				async () => {
+					const completed = await harness.tools
+						.get("inspect_subagent_batch")!
+						.execute("batch-background-completed", { batchId }, undefined, undefined, harness.context);
+					expect(completed.details.inspection.result).toBeDefined();
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+		} finally {
+			releaseBlockedChild();
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
+	it("surfaces durable check-in state by runId and disarms it at terminal completion", async () => {
+		const harness = await createAsyncToolHarness();
+		let releaseChild!: () => void;
+		let markChildStarted!: () => void;
+		const blockedChild = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		const childStarted = new Promise<void>((resolve) => {
+			markChildStarted = resolve;
+		});
+		const request = {
+			role: "self",
+			self: {
+				instructions: "Inspect the approved scope and return a short answer.",
+				capabilities: ["read", "grep", "find", "ls"],
+			},
+			task: "Inspect the source tree.",
+			scope: { roots: ["src"] },
+		};
+		try {
+			harness.faux.setResponses([
+				async () => {
+					markChildStarted();
+					await blockedChild;
+					return fauxAssistantMessage("Durable child completed.");
+				},
+			]);
+			const accepted = await harness.tools
+				.get("delegate_async")!
+				.execute("durable-check-in-launch", request, undefined, undefined, harness.context);
+			const jobId = accepted.details.accepted.jobId as string;
+			await childStarted;
+			await vi.waitFor(
+				async () => {
+					const inspection = await harness.tools
+						.get("inspect_subagent_job")!
+						.execute("durable-check-in-inspect", { jobId }, undefined, undefined, harness.context);
+					expect(inspection).toMatchObject({
+						details: { checkIn: { delivery: "armed", sequence: 0 } },
+					});
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			releaseChild();
+			await vi.waitFor(
+				async () => {
+					const inspection = await harness.tools
+						.get("inspect_subagent_job")!
+						.execute("durable-check-in-terminal", { jobId }, undefined, undefined, harness.context);
+					expect(inspection).toMatchObject({
+						details: { inspection: { job: { status: "completed" } } },
+					});
+					expect(inspection.details.checkIn).toBeUndefined();
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+		} finally {
+			releaseChild();
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
 	it("uses the correct foreground runId and durable jobId domains across real launches", async () => {
 		const harness = await createAsyncToolHarness();
 		const delegate = harness.tools.get("delegate")!;
@@ -728,13 +1104,7 @@ describe("ICE subagent contracts", () => {
 		};
 		try {
 			harness.faux.setResponses([fauxAssistantMessage("Managed child completed.")]);
-			const managed = await delegate.execute(
-				"managed-launch",
-				{ ...childRequest, background: true },
-				undefined,
-				undefined,
-				harness.context,
-			);
+			const managed = await delegate.execute("managed-launch", childRequest, undefined, undefined, harness.context);
 			expect(managed).toMatchObject({ isError: false, details: { managed: { runId: expect.any(String) } } });
 			const runId = managed.details.managed.runId as string;
 			const peeked = await manage.execute(
@@ -851,7 +1221,7 @@ describe("ICE subagent contracts", () => {
 			harness.faux.setResponses([
 				fauxAssistantMessage('{"summary":"Batch child completed.","evidence":{"paths":["src"]},"findings":[]}'),
 			]);
-			const batch = await harness.tools.get("delegate_batch")!.execute(
+			const batchLaunch = await harness.tools.get("delegate_batch")!.execute(
 				"batch-launch",
 				{
 					tasks: [
@@ -871,8 +1241,24 @@ describe("ICE subagent contracts", () => {
 				undefined,
 				harness.context,
 			);
-			expect(batch).toMatchObject({ isError: false, details: { result: { batchId: expect.any(String) } } });
-			const batchResult = batch.details.result as {
+			expect(batchLaunch).toMatchObject({ isError: false, details: { accepted: { batchId: expect.any(String) } } });
+			let batchInspection: { details: { inspection: { result?: unknown } } } | undefined;
+			await vi.waitFor(
+				async () => {
+					batchInspection = await harness.tools
+						.get("inspect_subagent_batch")!
+						.execute(
+							"batch-inspect",
+							{ batchId: batchLaunch.details.accepted.batchId },
+							undefined,
+							undefined,
+							harness.context,
+						);
+					expect(batchInspection!.details.inspection.result).toBeDefined();
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			const batchResult = batchInspection!.details.inspection.result as {
 				batchId: string;
 				items: Array<{ taskId: string; result: { runId: string } }>;
 			};
@@ -880,7 +1266,7 @@ describe("ICE subagent contracts", () => {
 			const batchId = batchResult.batchId;
 			const taskId = batchResult.items[0]!.taskId;
 			const batchRunId = batchResult.items[0]!.result.runId;
-			for (const runId of [batchId, taskId, batchRunId]) {
+			for (const runId of [batchId, taskId]) {
 				const rejected = await manage.execute(
 					"batch-as-foreground",
 					{ runId, action: "peek" },
@@ -891,6 +1277,15 @@ describe("ICE subagent contracts", () => {
 				expect(rejected).toMatchObject({ isError: true });
 				expect(rejected.content[0].text).toMatch(/foreground runId.*batchId.*taskId/i);
 			}
+			// Managed batch children are individually manageable by their own runId.
+			const managedChild = await manage.execute(
+				"batch-child-peek",
+				{ runId: batchRunId, action: "peek" },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(managedChild).toMatchObject({ isError: false });
 			for (const candidateJobId of [batchId, taskId, `job:${jobId}`]) {
 				const rejected = await inspectJob.execute(
 					"batch-as-job",
@@ -902,6 +1297,191 @@ describe("ICE subagent contracts", () => {
 				expect(rejected).toMatchObject({ isError: true });
 				expect(rejected.content[0].text).toMatch(/bare durable jobId.*batchId.*taskId/i);
 			}
+		} finally {
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
+	it("releases managed output artifacts when resume supersedes a result or delete forgets it", async () => {
+		const harness = await createAsyncToolHarness();
+		const manage = harness.tools.get("manage_subagent")!;
+		const readOutput = harness.tools.get("read_subagent_output")!;
+		const childRequest = {
+			role: "self",
+			self: {
+				instructions: "Inspect the approved scope and return a concise answer.",
+				capabilities: ["read", "grep", "find", "ls"],
+			},
+			task: "Inspect the source tree.",
+			scope: { roots: ["src"] },
+		};
+		try {
+			harness.faux.setResponses([
+				fauxAssistantMessage("first answer ".repeat(900)),
+				fauxAssistantMessage("resumed answer ".repeat(900)),
+			]);
+			const accepted = await harness.tools
+				.get("delegate")!
+				.execute("artifact-lifecycle-launch", childRequest, undefined, undefined, harness.context);
+			const runId = accepted.details.managed.runId as string;
+			let firstResult: SubagentResult | undefined;
+			await vi.waitFor(
+				async () => {
+					const observation = await manage.execute(
+						"artifact-lifecycle-first",
+						{ runId, action: "peek" },
+						undefined,
+						undefined,
+						harness.context,
+					);
+					firstResult = observation.details.observation.result as SubagentResult | undefined;
+					expect(firstResult?.status).toBe("completed");
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			const firstArtifactId = firstResult?.output?.artifact?.id;
+			if (!firstArtifactId) throw new Error("Expected the first final answer to be retained as an artifact.");
+			expect(
+				await readOutput.execute(
+					"artifact-lifecycle-read-first",
+					{ artifactId: firstArtifactId, length: 8 },
+					undefined,
+					undefined,
+					harness.context,
+				),
+			).toMatchObject({ isError: false });
+
+			const resumed = await manage.execute(
+				"artifact-lifecycle-resume",
+				{ runId, action: "resume", message: "Continue with a second answer." },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			const resumedRunId = resumed.details.result.runId as string;
+			const supersededRead = await readOutput.execute(
+				"artifact-lifecycle-read-superseded",
+				{ artifactId: firstArtifactId, length: 8 },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(supersededRead).toMatchObject({ isError: true });
+			const resumedResult = resumed.details.result as SubagentResult;
+			const resumedArtifactId = resumedResult.output?.artifact?.id;
+			if (!resumedArtifactId) throw new Error("Expected the resumed final answer to be retained as an artifact.");
+			expect(
+				await readOutput.execute(
+					"artifact-lifecycle-read-resumed",
+					{ artifactId: resumedArtifactId, length: 8 },
+					undefined,
+					undefined,
+					harness.context,
+				),
+			).toMatchObject({ isError: false });
+
+			const deleted = await manage.execute(
+				"artifact-lifecycle-delete",
+				{ runId: resumedRunId, action: "delete" },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(deleted).toMatchObject({
+				isError: false,
+				details: { action: "delete", deleted: { deleted: true } },
+			});
+			expect(
+				await readOutput.execute(
+					"artifact-lifecycle-read-deleted",
+					{ artifactId: resumedArtifactId, length: 8 },
+					undefined,
+					undefined,
+					harness.context,
+				),
+			).toMatchObject({ isError: true });
+		} finally {
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
+	it("retains batch output while its aggregate owner survives child deletion", async () => {
+		const harness = await createAsyncToolHarness();
+		const longReport = JSON.stringify({
+			summary: "long structured result ".repeat(500),
+			evidence: { paths: ["src"] },
+			findings: [],
+		});
+		const taskInput = ["long", "short"].map((id) => ({
+			id,
+			role: "self",
+			self: {
+				instructions: "Inspect the approved scope and return structured evidence.",
+				capabilities: ["read", "grep", "find", "ls"],
+			},
+			task: "Inspect the source tree.",
+			scope: { roots: ["src"] },
+		}));
+		try {
+			harness.faux.setResponses([
+				fauxAssistantMessage(longReport),
+				fauxAssistantMessage('{"summary":"Short result.","evidence":{"paths":["src"]},"findings":[]}'),
+			]);
+			const accepted = await harness.tools
+				.get("delegate_batch")!
+				.execute("batch-artifact-launch", { tasks: taskInput }, undefined, undefined, harness.context);
+			const batchId = accepted.details.accepted.batchId as string;
+			const taskRuns = accepted.details.accepted.tasks as Array<{ taskId: string; runId: string }>;
+			let aggregate: { items: Array<{ taskId: string; result: SubagentResult }> } | undefined;
+			await vi.waitFor(
+				async () => {
+					const inspection = await harness.tools
+						.get("inspect_subagent_batch")!
+						.execute("batch-artifact-inspect", { batchId }, undefined, undefined, harness.context);
+					aggregate = inspection.details.inspection.result as
+						| { items: Array<{ taskId: string; result: SubagentResult }> }
+						| undefined;
+					expect(aggregate).toBeDefined();
+					expect(aggregate?.items.some((item) => item.result.output?.artifact)).toBe(true);
+				},
+				{ timeout: 5_000, interval: 10 },
+			);
+			const artifactItem = aggregate?.items.find((item) => item.result.output?.artifact);
+			const artifactId = artifactItem?.result.output?.artifact?.id;
+			const childRunId = taskRuns.find((task) => task.taskId === artifactItem?.taskId)?.runId;
+			if (!artifactId || !childRunId) throw new Error("Expected a retained batch child artifact and run handle.");
+			const readOutput = harness.tools.get("read_subagent_output")!;
+			expect(
+				await readOutput.execute(
+					"batch-artifact-read-before-delete",
+					{ artifactId, length: 8 },
+					undefined,
+					undefined,
+					harness.context,
+				),
+			).toMatchObject({ isError: false });
+
+			const deleted = await harness.tools
+				.get("manage_subagent")!
+				.execute(
+					"batch-artifact-delete-child",
+					{ runId: childRunId, action: "delete" },
+					undefined,
+					undefined,
+					harness.context,
+				);
+			expect(deleted).toMatchObject({ isError: false, details: { deleted: { deleted: true } } });
+			expect(
+				await readOutput.execute(
+					"batch-artifact-read-after-delete",
+					{ artifactId, length: 8 },
+					undefined,
+					undefined,
+					harness.context,
+				),
+			).toMatchObject({ isError: false });
 		} finally {
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
 			harness.faux.unregister();
@@ -922,7 +1502,7 @@ describe("ICE subagent contracts", () => {
 			)) as ManageOutcome;
 
 		// Live-only actions reject an unknown handle at the ownership boundary.
-		for (const action of ["peek", "inspect", "detach", "stop", "extend"] as const) {
+		for (const action of ["peek", "inspect", "detach", "stop"] as const) {
 			const rejected = await execute({ action });
 			expect(rejected.isError).toBe(true);
 			expect(rejected.details?.error?.code).toBe("child_protocol_failure");
@@ -1396,6 +1976,13 @@ describe("ICE subagent contracts", () => {
 					source: request.profile.source,
 					status: "completed",
 					summary: "ok",
+					output: {
+						text: "ok",
+						textBytes: 2,
+						originalBytes: 2,
+						inlineTruncated: false,
+						captureStatus: "inline_complete",
+					},
 					observedOutputBytes: 2,
 					partial: false,
 					diagnostics: [],
@@ -1446,6 +2033,13 @@ describe("ICE subagent contracts", () => {
 					source: request.profile.source,
 					status: "completed",
 					summary: "ok",
+					output: {
+						text: "ok",
+						textBytes: 2,
+						originalBytes: 2,
+						inlineTruncated: false,
+						captureStatus: "inline_complete",
+					},
 					observedOutputBytes: 2,
 					partial: false,
 					diagnostics: [],
@@ -1496,6 +2090,13 @@ describe("ICE subagent contracts", () => {
 					source: request.profile.source,
 					status: "completed",
 					summary: "ok",
+					output: {
+						text: "ok",
+						textBytes: 2,
+						originalBytes: 2,
+						inlineTruncated: false,
+						captureStatus: "inline_complete",
+					},
 					observedOutputBytes: 2,
 					partial: false,
 					diagnostics: [],
@@ -1785,7 +2386,14 @@ describe("ICE subagent contracts", () => {
 				source: "self",
 				status: "completed",
 				summary: "host command inspected source",
-				observedOutputBytes: 32,
+				output: {
+					text: "host command inspected source",
+					textBytes: Buffer.byteLength("host command inspected source"),
+					originalBytes: Buffer.byteLength("host command inspected source"),
+					inlineTruncated: false,
+					captureStatus: "inline_complete" as const,
+				},
+				observedOutputBytes: Buffer.byteLength("host command inspected source"),
 				partial: false,
 				diagnostics: [],
 				evidence: { paths: ["src"] },
@@ -1901,7 +2509,8 @@ describe("ICE subagent contracts", () => {
 				harness.context,
 			);
 		expect(result).toMatchObject({ isError: false });
-		expect(result.content[0].text).toMatch(/YOLO direct parent workspace|no isolation/i);
+		expect(result.details).toMatchObject({ accepted: { workspaceIsolation: "parent" } });
+		expect(result.content[0].text).toMatch(/explicitly authorized parent workspace/i);
 	});
 
 	it("defines configurable subagent attachment and expansion actions", () => {
@@ -2116,37 +2725,35 @@ describe("ICE subagent contracts", () => {
 		expect(exact).toMatchObject({ name: "explorer", source: "user", description: "Exact explorer" });
 	});
 
-	it("bounds configurable thinking, timeout, and output metadata with diagnostics", async () => {
+	it("bounds configurable thinking and startup timeout metadata with diagnostics", async () => {
 		const cwd = await createWorkspace();
 		const agentDir = await mkdtemp(join(tmpdir(), "ice-subagents-bounds-agent-"));
 		tempDirs.push(agentDir);
 		await mkdir(join(agentDir, "agents"), { recursive: true });
 		await writeFile(
 			join(agentDir, "agents", "bounded.md"),
-			`---\nname: bounded\ndescription: Bounded profile\ntools: read\nthinking: nonsense\ntimeout: ${SUBAGENT_PROFILE_LIMITS.maxTimeoutMs * 2}\nmax-output-bytes: ${SUBAGENT_PROFILE_LIMITS.minOutputBytes - 1}\n---\nInspect.\n`,
+			`---\nname: bounded\ndescription: Bounded profile\ntools: read\nthinking: nonsense\nstartup-timeout-ms: ${SUBAGENT_PROFILE_LIMITS.maxTimeoutMs * 2}\n---\nInspect.\n`,
 		);
 		const bounded = resolveSubagentProfileResolution("bounded", { cwd, agentDir, projectTrusted: false });
 		expect(bounded).toMatchObject({
 			thinkingLevel: "low",
 			timeoutMs: SUBAGENT_PROFILE_LIMITS.maxTimeoutMs,
-			maxOutputBytes: SUBAGENT_PROFILE_LIMITS.minOutputBytes,
 		});
 		expect(bounded.diagnostics).toEqual(
 			expect.arrayContaining([
 				expect.stringMatching(/invalid thinking metadata/i),
-				expect.stringContaining(`timeout metadata clamped to ${SUBAGENT_PROFILE_LIMITS.maxTimeoutMs}`),
-				expect.stringContaining(`max-output-bytes metadata clamped to ${SUBAGENT_PROFILE_LIMITS.minOutputBytes}`),
+				expect.stringContaining(`startup timeout metadata clamped to ${SUBAGENT_PROFILE_LIMITS.maxTimeoutMs}`),
 			]),
 		);
 
 		await writeFile(
 			join(agentDir, "agents", "fallback-bounds.md"),
-			"---\nname: fallback-bounds\ndescription: Invalid numeric metadata\ntools: read\ntimeout: nope\nmax-output-bytes: -1\n---\nInspect.\n",
+			"---\nname: fallback-bounds\ndescription: Invalid numeric metadata\ntools: read\nstartup-timeout-ms: nope\n---\nInspect.\n",
 		);
 		const fallback = resolveSubagentProfileResolution("fallback-bounds", { cwd, agentDir, projectTrusted: false });
-		expect(fallback).toMatchObject({ timeoutMs: 60_000, maxOutputBytes: 24 * 1024 });
-		expect(fallback.diagnostics?.join("\n")).toMatch(/invalid timeout metadata/i);
-		expect(fallback.diagnostics?.join("\n")).toMatch(/invalid max-output-bytes metadata/i);
+		expect(fallback).toMatchObject({ timeoutMs: 60_000 });
+		expect(fallback).not.toHaveProperty("maxOutputBytes");
+		expect(fallback.diagnostics?.join("\n")).toMatch(/invalid startup timeout metadata/i);
 	});
 
 	it("intersects parent capabilities with the file-agent tool policy", async () => {
@@ -2167,7 +2774,6 @@ describe("ICE subagent contracts", () => {
 				tools: ["read", "grep"],
 				thinkingLevel: "low",
 				timeoutMs: 60_000,
-				maxOutputBytes: 24 * 1024,
 				modelPolicy: "inherit-parent",
 			}),
 		).toEqual(["read", "grep"]);
@@ -2180,7 +2786,6 @@ describe("ICE subagent contracts", () => {
 				tools: ["read"],
 				thinkingLevel: "low",
 				timeoutMs: 60_000,
-				maxOutputBytes: 24 * 1024,
 				modelPolicy: "inherit-parent",
 			}),
 		).toEqual([]);
@@ -2895,6 +3500,9 @@ describe("ICE subagent contracts", () => {
 		expect(firstKey).toMatch(/^ice-fork-v1-[0-9a-f]{52}$/);
 		expect(secondKey).toBe(firstKey);
 		expect(deriveSubagentPromptCacheKey(first, testModel("faux", "faux-model"), ["grep"])).not.toBe(firstKey);
+		expect(deriveSubagentPromptCacheKey(first, testModel("faux", "faux-model"), ["read"], false, true)).not.toBe(
+			firstKey,
+		);
 		expect(
 			deriveSubagentPromptCacheKey(normalizeSubagentRequest(request(cwd), cwd), undefined, ["read"]),
 		).toBeUndefined();
@@ -4202,11 +4810,12 @@ describe("ICE subagent contracts", () => {
 		}
 	});
 
-	it("removes writer worktrees after failure, cancellation, and timeout", async () => {
-		const runPending = async (mode: "cancelled" | "timed_out"): Promise<WriterResult> => {
+	it("removes writer worktrees after cancellation and does not impose a post-start lifetime timeout", async () => {
+		const runPending = async (waitPastStartupDeadline: boolean): Promise<WriterResult> => {
 			const { cwd, head } = await createGitWorkspace();
 			const controller = new AbortController();
 			let abortCalls = 0;
+			let promptStarted = false;
 			const lifecycle: string[] = [];
 			const shutdown = vi.fn(async () => {
 				lifecycle.push("shutdown");
@@ -4214,7 +4823,10 @@ describe("ICE subagent contracts", () => {
 			const fakeSession = {
 				model: testModel("faux", "faux"),
 				messages: [],
-				prompt: async () => new Promise<void>(() => {}),
+				prompt: async () => {
+					promptStarted = true;
+					return new Promise<void>(() => {});
+				},
 				abort: async () => {
 					abortCalls++;
 				},
@@ -4225,10 +4837,7 @@ describe("ICE subagent contracts", () => {
 				},
 				getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 }),
 			} as unknown as CreateAgentSessionResult["session"];
-			const request = normalizeWriterRequest(
-				{ ...writerRequest(cwd, head), ...(mode === "timed_out" ? { timeoutMs: 1 } : {}) },
-				cwd,
-			);
+			const request = normalizeWriterRequest({ ...writerRequest(cwd, head), timeoutMs: 25 }, cwd);
 			let started = false;
 			const promise = new NativeWriterRunner({
 				createSession: async () => {
@@ -4237,11 +4846,15 @@ describe("ICE subagent contracts", () => {
 				},
 			}).run(request, ["delegate_write", "read", "grep", "find", "ls", "write", "edit"], {
 				model: testModel("faux", "faux"),
-				signal: mode === "cancelled" ? controller.signal : undefined,
+				signal: controller.signal,
 			});
-			for (let attempt = 0; attempt < 20 && !started; attempt++)
+			for (let attempt = 0; attempt < 20 && (!started || !promptStarted); attempt++)
 				await new Promise((resolve) => setTimeout(resolve, 0));
-			if (mode === "cancelled") controller.abort();
+			if (waitPastStartupDeadline) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				expect(abortCalls).toBe(0);
+			}
+			controller.abort();
 			const result = await promise;
 			expect(abortCalls).toBe(1);
 			expect(shutdown).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
@@ -4250,8 +4863,8 @@ describe("ICE subagent contracts", () => {
 			expect(await git(cwd, "status", "--porcelain=v1", "-uall")).toBe("");
 			return result;
 		};
-		await expect(runPending("cancelled")).resolves.toMatchObject({ status: "cancelled" });
-		await expect(runPending("timed_out")).resolves.toMatchObject({ status: "timed_out" });
+		await expect(runPending(false)).resolves.toMatchObject({ status: "cancelled" });
+		await expect(runPending(true)).resolves.toMatchObject({ status: "cancelled" });
 	});
 
 	it("reports writer child failures without changing the parent", async () => {
@@ -4581,15 +5194,15 @@ describe("ICE subagent contracts", () => {
 			}),
 		).toThrowError(/not supported by the selected parent model route/);
 		expect(() =>
-			normalizeSubagentExecutionOverride(
-				{ thinkingLevel: "low", maxOutputBytes: 8192 },
-				{ thinking: "flash" as never },
-			),
+			normalizeSubagentExecutionOverride({ thinkingLevel: "low" }, { thinking: "flash" as never }),
 		).toThrowError(/thinking must be a supported level/);
 	});
 
-	it("rejects removed aggregate token execution overrides before launch", async () => {
+	it("rejects removed caller-controlled execution output budgets before launch", async () => {
 		const cwd = await createWorkspace();
+		expect(() =>
+			normalizeSubagentRequest({ ...request(cwd), execution: { maxOutputBytes: 1_024 } as never }, cwd),
+		).toThrowError(/execution\.maxOutputBytes.*removed/i);
 		expect(() =>
 			normalizeSubagentRequest({ ...request(cwd), execution: { maxTotalTokens: 20_000 } as never }, cwd),
 		).toThrowError(/maxTotalTokens.*removed/i);
@@ -5106,16 +5719,24 @@ describe("ICE subagent contracts", () => {
 		expect(result.status).not.toBe("timed_out");
 	});
 
-	it("reports an actual child deadline as a timeout", async () => {
+	it("keeps an admitted child running beyond the startup deadline until explicitly cancelled", async () => {
 		const cwd = await createWorkspace();
 		const normalized = normalizeSubagentRequest({ ...request(cwd), timeoutMs: 20 }, cwd);
+		const controller = new AbortController();
+		let markPromptStarted!: () => void;
+		const promptStarted = new Promise<void>((resolve) => {
+			markPromptStarted = resolve;
+		});
 		const fakeSession = {
 			sessionId: "child-real-timeout",
 			model: {} as Model<Api>,
 			messages: [],
 			extensionRunner: createNoopExtensionRunner(),
 			subscribe: vi.fn(() => vi.fn()),
-			prompt: vi.fn(() => new Promise<void>(() => {})),
+			prompt: vi.fn(() => {
+				markPromptStarted();
+				return new Promise<void>(() => {});
+			}),
 			abort: vi.fn(async () => {}),
 			dispose: vi.fn(),
 			getSessionStats: vi.fn(() => ({
@@ -5123,14 +5744,18 @@ describe("ICE subagent contracts", () => {
 				cost: 0.25,
 			})),
 		} as unknown as CreateAgentSessionResult["session"];
-		const result = await new NativeSubagentRunner({
+		const runPromise = new NativeSubagentRunner({
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
-		}).runResolved(normalized, ["delegate", "read"]);
-
-		expect(result).toMatchObject({
-			status: "timed_out",
-			diagnostics: [{ code: "timeout" }],
+		}).runResolved(normalized, ["delegate", "read"], {
+			signal: controller.signal,
+			noLifetimeTimeout: true,
 		});
+
+		await promptStarted;
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		expect(fakeSession.abort).not.toHaveBeenCalled();
+		controller.abort();
+		await expect(runPromise).resolves.toMatchObject({ status: "cancelled" });
 		expect(fakeSession.abort).toHaveBeenCalledOnce();
 	});
 
@@ -5217,17 +5842,21 @@ describe("ICE subagent contracts", () => {
 					'{"summary":"The concurrency headroom document was created and explains configuration and precedence.","evidence":{"paths":["src/ice-subagent-concurrency.ts"]}}',
 				),
 			]);
-			const result = await harness.tools.get("delegate")!.execute(
-				"plain-json-fallback",
-				{
-					role: "self",
-					self: { instructions: "Inspect the approved scope.", capabilities: ["read"] },
-					task: "Inspect the concurrency implementation.",
-					scope: { roots: ["src"] },
-				},
-				undefined,
-				undefined,
+			const result = await settleManagedDelegate(
+				harness.tools,
 				harness.context,
+				await harness.tools.get("delegate")!.execute(
+					"plain-json-fallback",
+					{
+						role: "self",
+						self: { instructions: "Inspect the approved scope.", capabilities: ["read"] },
+						task: "Inspect the concurrency implementation.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
 			);
 			const text = result.content[0]?.text ?? "";
 			expect(result).toMatchObject({ isError: false });
@@ -5678,10 +6307,10 @@ describe("ICE subagent contracts", () => {
 			faux.unregister();
 		}
 	});
-	it("bounds plain final answers by assistant UTF-8 bytes rather than runtime envelope bytes", async () => {
+	it("retains plain final answers independently of caller byte limits", async () => {
 		const cwd = await createWorkspace();
 		const runCase = async (rawAnswer: string) => {
-			const normalized = normalizeSubagentRequest({ ...request(cwd), execution: { maxOutputBytes: 1_024 } }, cwd);
+			const normalized = normalizeSubagentRequest(request(cwd), cwd);
 			const messages: AgentMessage[] = [];
 			const fakeSession = {
 				sessionId: `plain-byte-boundary-${rawAnswer.length}`,
@@ -5713,12 +6342,15 @@ describe("ICE subagent contracts", () => {
 		expect(Buffer.byteLength(JSON.stringify(accepted), "utf8")).toBeGreaterThan(1_024);
 
 		const overBudget = "🙂".repeat(300);
-		const truncated = await runCase(overBudget);
-		expect(truncated.status).toBe("completed");
-		expect(truncated.truncated).toBe(true);
-		expect(truncated.observedOutputBytes).toBeLessThanOrEqual(1_024);
-		expect(Buffer.byteLength(truncated.summary, "utf8")).toBe(truncated.observedOutputBytes);
-		expect(truncated.summary.endsWith("�")).toBe(false);
+		const retained = await runCase(overBudget);
+		expect(retained.status).toBe("completed");
+		expect(retained.observedOutputBytes).toBe(Buffer.byteLength(overBudget, "utf8"));
+		expect(retained.output).toMatchObject({
+			captureStatus: "inline_complete",
+			text: overBudget,
+			originalBytes: Buffer.byteLength(overBudget, "utf8"),
+		});
+		expect(retained.summary).toBe(overBudget);
 	});
 
 	it("uses the core provider retry path without replaying a completed child tool", async () => {
@@ -6060,7 +6692,7 @@ describe("ICE subagent contracts", () => {
 		}
 	});
 
-	it("rejects reports above the complete output cap and records observed bytes", async () => {
+	it("rejects reports above the fixed parser input limit and records observed bytes", async () => {
 		const cwd = await createWorkspace();
 		const rawReport = JSON.stringify({ summary: "x".repeat(25 * 1024), evidence: { paths: ["src"] } });
 		const childMessages: AgentMessage[] = [];
@@ -6089,9 +6721,10 @@ describe("ICE subagent contracts", () => {
 			outputSchema: { type: "object" as const, additionalProperties: false },
 		};
 		const artifactRoot = join(cwd, ".artifacts");
+		const outputArtifacts = new SubagentOutputArtifactStore({ artifactRoot });
 		const normalized = normalizeSubagentRequest(structuredRequest, cwd);
 		const result = await new NativeSubagentRunner({
-			artifactRoot,
+			outputArtifacts,
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 		}).runResolved(normalized, ["delegate", "read"]);
 		// An oversized structured report is a bounded report-protocol failure after real work:
@@ -6100,18 +6733,22 @@ describe("ICE subagent contracts", () => {
 		expect(result.diagnostics[0]?.code).toBe("report_protocol_failure");
 		expect(result.observedOutputBytes).toBe(Buffer.byteLength(rawReport));
 		expect(result.workArtifact?.reportProtocol).toMatchObject({ status: "truncated" });
-		expect(result.reportArtifact).toMatchObject({
-			id: normalized.runId,
-			contentType: "application/json",
+		expect(result.output).toMatchObject({
+			captureStatus: "artifact_complete",
 			originalBytes: Buffer.byteLength(rawReport),
-			truncated: false,
+			artifact: { contentType: "application/json", truncated: false },
 		});
-		expect(result.diagnostics.some((diagnostic) => diagnostic.code === "report_spilled")).toBe(true);
-		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(normalized.maxOutputBytes);
+		expect(result.output?.artifact?.id).not.toBe(normalized.runId);
+		const stored = outputArtifacts.read({
+			ownerSessionId: normalized.parentSessionId,
+			artifactId: result.output!.artifact!.id,
+			length: 64,
+		});
+		expect(stored.text).toBe(rawReport.slice(0, 64));
 		expect(verifySubagentResult(result, normalized).verified).toBe(false);
 	});
 
-	it("spills oversized partial output on provider failure without exposing credentials", async () => {
+	it("does not publish partial provider output as a final artifact or leak credentials", async () => {
 		const cwd = await createWorkspace();
 		const rawPartial = `Bearer partial-secret\n${"y".repeat(SUBAGENT_REPORT_ARTIFACT_LIMITS.maxBytes + 64)}`;
 		const childMessages: AgentMessage[] = [
@@ -6142,13 +6779,10 @@ describe("ICE subagent contracts", () => {
 			artifactRoot,
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 		}).run(request(cwd), ["delegate", "read"]);
-		const artifact = result.reportArtifact;
 		expect(result.status).toBe("failed");
-		expect(artifact).toBeDefined();
-		expect(result.diagnostics.some((diagnostic) => diagnostic.code === "report_spilled")).toBe(true);
-		const saved = await readFile(artifact!.path, "utf8");
-		expect(saved).not.toContain("partial-secret");
-		expect(Buffer.byteLength(saved)).toBeLessThanOrEqual(SUBAGENT_REPORT_ARTIFACT_LIMITS.maxBytes);
+		expect(result.reportArtifact).toBeUndefined();
+		expect(result.output).toBeUndefined();
+		expect(JSON.stringify(result)).not.toContain("partial-secret");
 	});
 
 	it("uses a self-delegation structured report contract with findings", async () => {
@@ -6275,16 +6909,27 @@ describe("ICE subagent contracts", () => {
 		expect(result.usage).toMatchObject({ inputTokens: 3, outputTokens: 4, cost: 0.01 });
 	});
 
-	it("does not expose internal batch children as live or retained views", async () => {
+	it("exposes internal batch children while live without retaining them", async () => {
 		const cwd = await createWorkspace();
 		const childMessages: AgentMessage[] = [];
+		let markPromptStarted!: () => void;
+		const promptStarted = new Promise<void>((resolve) => {
+			markPromptStarted = resolve;
+		});
+		let releasePrompt!: () => void;
+		const promptGate = new Promise<void>((resolve) => {
+			releasePrompt = resolve;
+		});
 		const fakeSession = {
 			sessionId: "child-internal-batch",
 			model: {} as Model<Api>,
 			messages: childMessages,
+			sessionManager: { getCwd: () => cwd },
 			extensionRunner: createNoopExtensionRunner(),
 			subscribe: vi.fn(() => vi.fn()),
 			prompt: vi.fn(async () => {
+				markPromptStarted();
+				await promptGate;
 				childMessages.push({
 					role: "assistant",
 					content: '{"summary":"batch complete","evidence":{"paths":["src"]},"payload":{}}',
@@ -6300,6 +6945,7 @@ describe("ICE subagent contracts", () => {
 		} as unknown as CreateAgentSessionResult["session"];
 		const bridge = new IceAgentViewBridge();
 		const liveSessions = new SubagentLiveSessionRegistry();
+		bridge.connectLiveSessions(liveSessions);
 		const runner = new NativeSubagentRunner({
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 			agentViewBridge: bridge,
@@ -6311,12 +6957,21 @@ describe("ICE subagent contracts", () => {
 			cwd,
 		);
 
-		const result = await runner.runResolved(normalized, ["delegate", "read"], {
+		const runPromise = runner.runResolved(normalized, ["delegate", "read"], {
 			management: "internal",
 			batchId: "batch-internal",
 			taskId: "task-internal",
 		});
+		await promptStarted;
+		expect(liveSessions.list()).toHaveLength(1);
+		expect(bridge.getView(normalized.runId)).toMatchObject({
+			kind: "subagent",
+			live: true,
+			taskId: "task-internal",
+		});
 
+		releasePrompt();
+		const result = await runPromise;
 		expect(result.status).toBe("completed");
 		expect(liveSessions.list()).toEqual([]);
 		expect(bridge.getView(normalized.runId)).toBeUndefined();
@@ -6333,7 +6988,7 @@ describe("ICE subagent contracts", () => {
 		expect(createSession).not.toHaveBeenCalled();
 	});
 
-	it("returns a typed timeout when child session startup never settles", async () => {
+	it("returns a typed startup failure when child session startup never settles", async () => {
 		const cwd = await createWorkspace();
 		const normalized = normalizeSubagentRequest({ ...request(cwd), timeoutMs: 5 }, cwd);
 		const result = await Promise.race([
@@ -6345,10 +7000,10 @@ describe("ICE subagent contracts", () => {
 				setTimeout(() => reject(new Error("child startup timeout was not enforced")), 100),
 			),
 		]);
-		expect(result).toMatchObject({ status: "timed_out", diagnostics: [{ code: "timeout" }] });
+		expect(result).toMatchObject({ status: "failed", diagnostics: [{ code: "timeout" }] });
 	});
 
-	it("returns a typed timeout when writer session startup never settles", async () => {
+	it("returns a typed startup failure when writer session startup never settles", async () => {
 		const { cwd, head } = await createGitWorkspace();
 		const normalized = normalizeWriterRequest({ ...writerRequest(cwd, head), timeoutMs: 5 }, cwd);
 		const result = await Promise.race([
@@ -6362,13 +7017,13 @@ describe("ICE subagent contracts", () => {
 			),
 		]);
 		expect(result).toMatchObject({
-			status: "timed_out",
+			status: "failed",
 			workspaceRemoved: false,
 			diagnostics: [{ code: "timeout" }],
 		});
 	});
 
-	it("orderly shuts down a reader that finishes startup after timeout", async () => {
+	it("orderly shuts down a reader that finishes startup after the startup deadline", async () => {
 		const cwd = await createWorkspace();
 		const normalized = normalizeSubagentRequest({ ...request(cwd), timeoutMs: 5 }, cwd);
 		let resolveStartup: ((value: CreateAgentSessionResult) => void) | undefined;
@@ -6391,14 +7046,14 @@ describe("ICE subagent contracts", () => {
 		const result = await new NativeSubagentRunner({
 			createSession: async () => startup,
 		}).runResolved(normalized, ["delegate", "read"]);
-		expect(result).toMatchObject({ status: "timed_out", diagnostics: [{ code: "timeout" }] });
+		expect(result).toMatchObject({ status: "failed", diagnostics: [{ code: "timeout" }] });
 		resolveStartup?.({ session: fakeSession } as CreateAgentSessionResult);
 		await vi.waitFor(() => expect(fakeSession.dispose).toHaveBeenCalledOnce());
 		expect(shutdown).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 		expect(lifecycle).toEqual(["abort", "shutdown", "dispose"]);
 	});
 
-	it("orderly shuts down a writer that finishes startup after timeout", async () => {
+	it("orderly shuts down a writer that finishes startup after the startup deadline", async () => {
 		const { cwd, head } = await createGitWorkspace();
 		const normalized = normalizeWriterRequest({ ...writerRequest(cwd, head), timeoutMs: 5 }, cwd);
 		let resolveStartup: ((value: CreateAgentSessionResult) => void) | undefined;
@@ -6424,7 +7079,7 @@ describe("ICE subagent contracts", () => {
 			directWorkspace: true,
 			unsafeHostExec: true,
 		});
-		expect(result).toMatchObject({ status: "timed_out", diagnostics: [{ code: "timeout" }] });
+		expect(result).toMatchObject({ status: "failed", diagnostics: [{ code: "timeout" }] });
 		resolveStartup?.({ session: fakeSession } as CreateAgentSessionResult);
 		await vi.waitFor(() => expect(fakeSession.dispose).toHaveBeenCalledOnce());
 		expect(shutdown).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
@@ -6479,13 +7134,17 @@ describe("ICE subagent contracts", () => {
 		}
 	});
 
-	it("aborts a child when streamed output exceeds its byte budget", async () => {
+	it("finishes a child whose final answer exceeds the former output budget", async () => {
 		const cwd = await createWorkspace();
-		const normalized = normalizeSubagentRequest({ ...request(cwd), timeoutMs: 1_000 }, cwd);
+		const normalized = {
+			...normalizeSubagentRequest({ ...request(cwd), timeoutMs: 1_000 }, cwd),
+			reportMode: "plain_final_turn" as const,
+		};
 		let notify: ((event: AgentSessionEvent) => void) | undefined;
 		const abort = vi.fn(async () => {});
+		const finalAnswer = "x".repeat(30_000);
 		const fakeSession = {
-			sessionId: "child-output-budget",
+			sessionId: "child-output-no-cutoff",
 			model: testModel("faux", "faux"),
 			messages: [],
 			extensionRunner: createNoopExtensionRunner(),
@@ -6499,51 +7158,54 @@ describe("ICE subagent contracts", () => {
 					toolName: "read",
 					args: { path: join(cwd, "outside") },
 				} as AgentSessionEvent);
-				(fakeSession.messages as unknown[]).push({
-					role: "assistant",
-					content: `{"summary":"${"x".repeat(30_000)}","evidence":{"paths":["src"]}}`,
-				});
+				(fakeSession.messages as unknown[]).push({ role: "assistant", content: finalAnswer });
 				notify?.({ type: "message_update" } as AgentSessionEvent);
-				await new Promise<void>(() => {});
 			}),
 			abort,
 			dispose: vi.fn(),
 			getSessionStats: vi.fn(() => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 })),
 		} as unknown as CreateAgentSessionResult["session"];
 		const progressPaths: Array<string | undefined> = [];
-		const result = await Promise.race([
-			new NativeSubagentRunner({
-				artifactRoot: join(cwd, "artifacts"),
-				createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
-			}).runResolved(normalized, ["delegate", "read"], {
-				onEvent: (event) => {
-					if (event.type === "subagent_tool_start") progressPaths.push(event.path);
-				},
-			}),
-			new Promise<SubagentResult>((_, reject) =>
-				setTimeout(() => reject(new Error("output budget was not enforced during streaming")), 100),
-			),
-		]);
-		expect(result.status).toBe("failed");
-		expect(result.diagnostics[0]).toMatchObject({ code: "output_truncated" });
-		expect(result.reportArtifact).toMatchObject({
-			contentType: "text/plain",
-			originalBytes: 30_043,
-			truncated: false,
+		const result = await new NativeSubagentRunner({
+			artifactRoot: join(cwd, "artifacts"),
+			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
+		}).runResolved(normalized, ["delegate", "read"], {
+			onEvent: (event) => {
+				if (event.type === "subagent_tool_start") progressPaths.push(event.path);
+			},
 		});
-		expect(result.diagnostics.some((diagnostic) => diagnostic.code === "report_spilled")).toBe(true);
-		expect(abort).toHaveBeenCalledTimes(1);
+
+		expect(result.status).toBe("completed");
+		expect(result.output).toMatchObject({
+			text: finalAnswer.slice(0, 8 * 1024),
+			originalBytes: Buffer.byteLength(finalAnswer),
+			captureStatus: "artifact_complete",
+			artifact: { storedBytes: Buffer.byteLength(finalAnswer), truncated: false },
+		});
+		expect(abort).not.toHaveBeenCalled();
 		expect(progressPaths).toEqual([undefined]);
 	});
 
-	it("retains a historical view when streamed output truncates a child", async () => {
+	it("keeps oversized running output alive until explicit cancellation", async () => {
 		const cwd = await createWorkspace();
-		const normalized = normalizeSubagentRequest({ ...request(cwd), timeoutMs: 1_000 }, cwd);
+		const normalized = {
+			...normalizeSubagentRequest({ ...request(cwd), timeoutMs: 1_000 }, cwd),
+			reportMode: "plain_final_turn" as const,
+		};
+		const controller = new AbortController();
 		const bridge = new IceAgentViewBridge();
 		let notify: ((event: AgentSessionEvent) => void) | undefined;
-		const abort = vi.fn(async () => {});
+		let releasePrompt!: () => void;
+		const promptGate = new Promise<void>((resolve) => {
+			releasePrompt = resolve;
+		});
+		let reportProgress!: () => void;
+		const progress = new Promise<void>((resolve) => {
+			reportProgress = resolve;
+		});
+		const abort = vi.fn(async () => releasePrompt());
 		const fakeSession = {
-			sessionId: "child-output-budget-history",
+			sessionId: "child-output-explicit-stop",
 			model: testModel("faux", "faux"),
 			messages: [],
 			extensionRunner: createNoopExtensionRunner(),
@@ -6552,40 +7214,52 @@ describe("ICE subagent contracts", () => {
 				return vi.fn();
 			}),
 			prompt: vi.fn(async () => {
-				(fakeSession.messages as unknown[]).push({
-					role: "assistant",
-					content: `{"summary":"${"x".repeat(30_000)}","evidence":{"paths":["src"]}}`,
-				});
+				(fakeSession.messages as unknown[]).push({ role: "assistant", content: "x".repeat(30_000) });
 				notify?.({ type: "message_update" } as AgentSessionEvent);
-				await new Promise<void>(() => {});
+				reportProgress();
+				await promptGate;
 			}),
 			abort,
 			dispose: vi.fn(),
-			getSessionStats: vi.fn(() => ({
-				tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				cost: 0,
-			})),
+			getSessionStats: vi.fn(() => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 })),
 		} as unknown as CreateAgentSessionResult["session"];
-
-		const result = await new NativeSubagentRunner({
+		const runner = new NativeSubagentRunner({
 			artifactRoot: join(cwd, "artifacts"),
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 			agentViewBridge: bridge,
-		}).runResolved(normalized, ["delegate", "read"]);
+		});
+		const run = runner.runResolved(normalized, ["delegate", "read"], { signal: controller.signal });
+		let settled = false;
+		void run.then(() => {
+			settled = true;
+		});
+		await progress;
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		expect(abort).not.toHaveBeenCalled();
 
-		expect(result.status).toBe("failed");
-		expect(result.diagnostics[0]).toMatchObject({ code: "output_truncated" });
-		expect(result.reportArtifact?.path).toContain(join(cwd, "artifacts"));
+		controller.abort();
+		const result = await run;
+		expect(result.status, JSON.stringify({ diagnostics: result.diagnostics, summary: result.summary })).toBe(
+			"cancelled",
+		);
+		expect(result.diagnostics[0]).toMatchObject({ code: "cancellation" });
+		expect(abort).toHaveBeenCalledOnce();
 		expect(bridge.getView(normalized.runId)).toMatchObject({
 			kind: "historical-subagent",
-			status: "failed",
+			status: "cancelled",
 			readOnly: true,
 		});
 	});
 
-	it("reports timeout and orderly shuts down a child that does not settle", async () => {
+	it("keeps a retained child alive past the startup deadline and stops it only on explicit cancellation", async () => {
 		const cwd = await createWorkspace();
+		const controller = new AbortController();
 		const abort = vi.fn(async () => {});
+		let markPromptStarted!: () => void;
+		const promptStarted = new Promise<void>((resolve) => {
+			markPromptStarted = resolve;
+		});
 		const lifecycle: string[] = [];
 		const shutdown = vi.fn(async () => {
 			lifecycle.push("shutdown");
@@ -6594,10 +7268,13 @@ describe("ICE subagent contracts", () => {
 			lifecycle.push("dispose");
 		});
 		const fakeSession = {
-			sessionId: "child-timeout",
+			sessionId: "child-no-lifetime-timeout",
 			model: {} as Model<Api>,
 			messages: [],
-			prompt: vi.fn(() => new Promise<void>(() => {})),
+			prompt: vi.fn(() => {
+				markPromptStarted();
+				return new Promise<void>(() => {});
+			}),
 			subscribe: vi.fn(() => vi.fn()),
 			abort,
 			dispose,
@@ -6610,17 +7287,24 @@ describe("ICE subagent contracts", () => {
 		const runner = new NativeSubagentRunner({
 			createSession: async () => ({ session: fakeSession }) as CreateAgentSessionResult,
 		});
-		const result = await runner.run({ ...request(cwd), timeoutMs: 5 }, ["delegate", "read"], {
+		const runPromise = runner.run({ ...request(cwd), timeoutMs: 5 }, ["delegate", "read"], {
 			onEvent: (event) => events.push(event.type),
+			signal: controller.signal,
+			noLifetimeTimeout: true,
 		});
-		expect(result.status).toBe("timed_out");
+		await promptStarted;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(abort).not.toHaveBeenCalled();
+		controller.abort();
+		const result = await runPromise;
+		expect(result.status).toBe("cancelled");
 		expect(abort).toHaveBeenCalledOnce();
-		// Timed-out children remain history-only until the parent explicitly deletes them.
+		// Explicitly cancelled children remain history-only until the parent deletes them.
 		const retained = runner.listRetainedChildren("parent-1");
-		expect(retained).toEqual([expect.objectContaining({ terminalStatus: "timed_out" })]);
+		expect(retained).toEqual([expect.objectContaining({ terminalStatus: "cancelled" })]);
 		expect(shutdown).not.toHaveBeenCalled();
 		expect(dispose).not.toHaveBeenCalled();
-		expect(events.at(-1)).toBe("subagent_timed_out");
+		expect(events.at(-1)).toBe("subagent_cancelled");
 		expect(await runner.deleteRetainedChild(retained[0]!.runId, "parent-1")).toEqual({
 			runId: retained[0]!.runId,
 			deleted: true,
@@ -6863,59 +7547,7 @@ describe("ICE subagent contracts", () => {
 		expect(started).not.toContain("four");
 	});
 
-	it("terminalizes queued tasks on batch timeout without launching them", async () => {
-		vi.useFakeTimers();
-		try {
-			const cwd = await createWorkspace();
-			const tasks = ["slow", "queued-a", "queued-b"].map((id) => resolvedBatchTask(cwd, id));
-			const taskStates: SubagentBatchTaskLifecycleEvent[] = [];
-			const started: string[] = [];
-			const runner: Pick<NativeSubagentRunner, "runResolved"> = {
-				runResolved: async (task, _parentTools, options) => {
-					const resolvedTask = tasks.find((candidate) => candidate.request.runId === task.runId)!;
-					started.push(resolvedTask.id);
-					return new Promise<SubagentResult>((resolve) => {
-						options?.signal?.addEventListener(
-							"abort",
-							() => resolve(batchResult(resolvedTask, "cancelled", "timeout")),
-							{ once: true },
-						);
-					});
-				},
-			};
-			const batchPromise = runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
-				concurrency: 1,
-				timeoutMs: 5,
-				onTaskState: (event) => taskStates.push(event),
-			});
-			await vi.advanceTimersByTimeAsync(5);
-
-			const result = await batchPromise;
-			expect(result.status).toBe("timed_out");
-			expect(result.items.map((item) => item.result.status)).toEqual(["timed_out", "timed_out", "timed_out"]);
-			expect(taskStates.filter((event) => event.type === "task_skipped")).toEqual([
-				{
-					type: "task_skipped",
-					batchId: taskStates[0]?.batchId,
-					taskId: "queued-a",
-					status: "timed_out",
-					reason: "Batch timed_out.",
-				},
-				{
-					type: "task_skipped",
-					batchId: taskStates[0]?.batchId,
-					taskId: "queued-b",
-					status: "timed_out",
-					reason: "Batch timed_out.",
-				},
-			]);
-			expect(started).toEqual(["slow"]);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("retries a proven pre-effect startup failure with the same authority and remaining execution/output limits", async () => {
+	it("retries a proven pre-effect startup failure with the same authority and remaining deadline", async () => {
 		const cwd = await createWorkspace();
 		const task = resolvedBatchTask(cwd, "retry");
 		const attempts: number[] = [];
@@ -6945,9 +7577,7 @@ describe("ICE subagent contracts", () => {
 			scope: task.request.scope,
 			profile: task.request.profile,
 		});
-		expect((requests[1] as typeof task.request).maxOutputBytes).toBe(
-			task.request.maxOutputBytes - Buffer.byteLength("temporary"),
-		);
+		expect((requests[1] as typeof task.request).timeoutMs).toBeLessThanOrEqual(task.request.timeoutMs);
 		expect(result.status).toBe("completed");
 		expect(result.observedOutputBytes).toBe(Buffer.byteLength("ok"));
 		expect(result.recovery?.totalObservedOutputBytes).toBe(Buffer.byteLength("temporary") + Buffer.byteLength("ok"));
@@ -6972,6 +7602,31 @@ describe("ICE subagent contracts", () => {
 				{ attempt: 2, status: "completed", observedOutputBytes: Buffer.byteLength("ok") },
 			],
 		});
+	});
+
+	it("does not suppress startup recovery because the first attempt reported many bytes", async () => {
+		const cwd = await createWorkspace();
+		const task = resolvedBatchTask(cwd, "large-startup-output");
+		const observedFirstBytes = 32 * 1024;
+		const attempts: number[] = [];
+		const result = await runSubagentWithRecovery(task.request, ["delegate", "read"], (attempt) => {
+			attempts.push(attempt);
+			if (attempt === 1) {
+				return Promise.resolve({
+					...batchResult(task, "failed", "startup failed"),
+					childSessionId: undefined,
+					partial: false,
+					retrySafeStartup: true,
+					observedTurns: 0,
+					observedOutputBytes: observedFirstBytes,
+					diagnostics: [{ code: "child_startup_failure" as const, message: "startup failed", retryable: true }],
+				});
+			}
+			return Promise.resolve(batchResult(task));
+		});
+		expect(attempts).toEqual([1, 2]);
+		expect(result.status).toBe("completed");
+		expect(result.recovery?.totalObservedOutputBytes).toBe(observedFirstBytes + Buffer.byteLength("ok"));
 	});
 
 	it("suppresses a direct retry after parent cancellation before runner invocation", async () => {
@@ -6999,34 +7654,6 @@ describe("ICE subagent contracts", () => {
 		expect(result.status).toBe("cancelled");
 		expect(result.diagnostics[0]).toMatchObject({ code: "cancellation" });
 		expect(result.recovery).toMatchObject({ attemptCount: 1, retried: false });
-	});
-
-	it("suppresses a batch retry after timeout before runner invocation", async () => {
-		const cwd = await createWorkspace();
-		const task = resolvedBatchTask(cwd, "timed-out-retry");
-		let calls = 0;
-		const result = await runResolvedSubagentBatch(
-			[task],
-			["delegate", "read"],
-			{
-				runResolved: async () => {
-					calls++;
-					if (calls === 1) {
-						await new Promise((resolve) => setTimeout(resolve, 10));
-						return {
-							...batchResult(task, "failed", "temporary"),
-							diagnostics: [{ code: "child_runtime_failure" as const, message: "temporary", retryable: true }],
-						};
-					}
-					return batchResult(task);
-				},
-			},
-			{ timeoutMs: 1, totalBudgetBytes: task.request.maxOutputBytes * 2 },
-		);
-		expect(calls).toBe(1);
-		expect(result.items[0]?.result.status).toBe("timed_out");
-		expect(result.items[0]?.result.diagnostics[0]).toMatchObject({ code: "timeout" });
-		expect(result.budget.released).toBe(task.request.maxOutputBytes - Buffer.byteLength("temporary"));
 	});
 
 	it("suppresses a fail-fast sibling retry before runner invocation", async () => {
@@ -7057,7 +7684,6 @@ describe("ICE subagent contracts", () => {
 		const result = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
 			concurrency: 2,
 			failFast: true,
-			totalBudgetBytes: tasks[0]!.request.maxOutputBytes * 2,
 		});
 		expect(calls).toEqual(
 			new Map([
@@ -7067,8 +7693,7 @@ describe("ICE subagent contracts", () => {
 		);
 		expect(result.items[0]?.result.status).toBe("cancelled");
 		expect(result.items[0]?.result.diagnostics[0]).toMatchObject({ code: "cancellation" });
-		expect(result.budget.consumed).toBe(Buffer.byteLength("temporary") + Buffer.byteLength("failure-1"));
-		expect(result.budget.released).toBe(result.budget.total - result.budget.consumed);
+		expect(result.items).toHaveLength(2);
 	});
 
 	it("verifies terminal output against its attempt cap while recovery tracks all bytes", async () => {
@@ -7115,45 +7740,38 @@ describe("ICE subagent contracts", () => {
 					};
 				},
 			},
-			{ totalBudgetBytes: task.request.maxOutputBytes * 2 },
+			{},
 		);
 		expect(calls).toBe(2);
 		expect(result.items[0]?.verification.verified).toBe(true);
 		expect(result.items[0]?.result.observedOutputBytes).toBe(attemptBytes);
 		expect(result.items[0]?.result.recovery?.totalObservedOutputBytes).toBe(attemptBytes * 2);
-		expect(result.budget.consumed).toBe(attemptBytes * 2);
-		expect(result.budget.consumed).toBeLessThanOrEqual(result.budget.total);
+		expect(result.preflight).not.toHaveProperty("budget");
 	});
 
-	it("suppresses a retry when the batch cannot reserve its next attempt", async () => {
+	it("does not suppress a retry based on batch output-byte reservations", async () => {
 		const cwd = await createWorkspace();
 		const task = resolvedBatchTask(cwd, "budget-blocked");
 		const attemptBytes = 15 * 1024;
 		let calls = 0;
-		const result = await runResolvedSubagentBatch(
-			[task],
-			["delegate", "read"],
-			{
-				runResolved: async () => {
-					calls++;
-					return {
-						...batchResult(task, "failed"),
-						childSessionId: undefined,
-						partial: false,
-						retrySafeStartup: true,
-						observedTurns: 0,
-						observedOutputBytes: attemptBytes,
-						diagnostics: [{ code: "child_startup_failure" as const, message: "temporary", retryable: true }],
-					};
-				},
+		const result = await runResolvedSubagentBatch([task], ["delegate", "read"], {
+			runResolved: async () => {
+				calls++;
+				return {
+					...batchResult(task, "failed"),
+					childSessionId: undefined,
+					partial: false,
+					retrySafeStartup: true,
+					observedTurns: 0,
+					observedOutputBytes: attemptBytes,
+					diagnostics: [{ code: "child_startup_failure" as const, message: "temporary", retryable: true }],
+				};
 			},
-			{ totalBudgetBytes: task.request.maxOutputBytes },
-		);
-		expect(calls).toBe(1);
-		expect(result.items[0]?.result.diagnostics[0]?.code).toBe("batch_budget_exhausted");
-		expect(result.budget.consumed).toBe(attemptBytes);
-		expect(result.budget.consumed).toBeLessThanOrEqual(result.budget.total);
-		expect(result.budget.reserved).toBe(0);
+		});
+		expect(calls).toBe(2);
+		expect(result.items[0]?.result.diagnostics[0]?.code).toBe("child_startup_failure");
+		expect(result.items[0]?.result.recovery?.totalObservedOutputBytes).toBe(attemptBytes * 2);
+		expect(result).not.toHaveProperty("budget");
 	});
 
 	it("does not retry an untyped failure even when its message sounds transient", async () => {
@@ -7247,7 +7865,7 @@ describe("ICE subagent contracts", () => {
 		expect(result.items.map((item) => item.taskId)).toEqual(launchOrder);
 	});
 
-	it("releases unused reservations and blocks over-budget launches", async () => {
+	it("admits siblings without output-byte reservations while preserving concurrency", async () => {
 		const cwd = await createWorkspace();
 		const tasks = ["short", "blocked"].map((id) => resolvedBatchTask(cwd, id));
 		let calls = 0;
@@ -7258,72 +7876,62 @@ describe("ICE subagent contracts", () => {
 				return batchResult(resolvedTask, "completed", calls === 1 ? "ok" : "second");
 			},
 		};
-		const releasedBatch = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
+		const taskStates: SubagentBatchTaskLifecycleEvent[] = [];
+		const batch = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
 			concurrency: 1,
-			totalBudgetBytes: tasks[0]!.request.maxOutputBytes + 1024,
+			onTaskState: (event) => taskStates.push(event),
 		});
 		expect(calls).toBe(2);
-		expect(releasedBatch.items.every((item) => item.result.status === "completed")).toBe(true);
-		expect(releasedBatch.budget.released).toBeGreaterThan(0);
-
-		calls = 0;
-		const blockedTaskStates: SubagentBatchTaskLifecycleEvent[] = [];
-		const blockedBatch = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
-			concurrency: 2,
-			totalBudgetBytes: tasks[0]!.request.maxOutputBytes,
-			onTaskState: (event) => blockedTaskStates.push(event),
-		});
-		expect(calls).toBe(1);
-		expect(blockedBatch.items[1]?.result.diagnostics[0]?.code).toBe("batch_budget_exhausted");
-		expect(blockedBatch.budget.reserved).toBe(0);
-		expect(blockedTaskStates.map((event) => event.type)).toEqual([
+		expect(batch.items.every((item) => item.result.status === "completed")).toBe(true);
+		expect(batch).not.toHaveProperty("budget");
+		expect(taskStates.map((event) => event.type)).toEqual([
 			"task_queued",
 			"task_queued",
 			"task_admitted",
-			"task_skipped",
+			"task_admitted",
 		]);
-		expect(blockedTaskStates.map((event) => event.taskId)).toEqual(["short", "blocked", "short", "blocked"]);
-		expect(blockedTaskStates[3]).toMatchObject({
-			type: "task_skipped",
-			batchId: blockedTaskStates[0]?.batchId,
-			taskId: "blocked",
-			status: "failed",
-			reason: "Batch budget cannot reserve this task.",
-		});
+		expect(taskStates.map((event) => event.taskId)).toEqual(["short", "blocked", "short", "blocked"]);
 	});
 
-	it("reconciles the batch budget from observed report bytes", async () => {
+	it("does not publish a batch output budget when observed bytes equal the former cap", async () => {
 		const cwd = await createWorkspace();
 		const tasks = [resolvedBatchTask(cwd, "observed")];
 		const runner: Pick<NativeSubagentRunner, "runResolved"> = {
 			runResolved: async (task) => {
 				const resolvedTask = tasks.find((candidate) => candidate.request.runId === task.runId)!;
-				return { ...batchResult(resolvedTask), observedOutputBytes: task.maxOutputBytes };
+				return { ...batchResult(resolvedTask), observedOutputBytes: 1_024 };
 			},
 		};
-		const result = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
-			totalBudgetBytes: tasks[0]!.request.maxOutputBytes,
-		});
-		expect(result.budget.consumed).toBe(tasks[0]!.request.maxOutputBytes);
-		expect(result.budget.released).toBe(0);
+		const result = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner);
+		expect(result.status).toBe("completed");
+		expect(result).not.toHaveProperty("budget");
 	});
 
-	it("never charges the batch ledger above its total on an output overrun", async () => {
+	it("does not reject or charge a batch when observed output exceeds the former cap", async () => {
 		const cwd = await createWorkspace();
 		const task = resolvedBatchTask(cwd, "overrun");
-		const result = await runResolvedSubagentBatch(
-			[task],
-			["delegate", "read"],
-			{
-				runResolved: async () => ({
-					...batchResult(task),
-					observedOutputBytes: task.request.maxOutputBytes * 2,
-				}),
-			},
-			{ totalBudgetBytes: task.request.maxOutputBytes },
+		const result = await runResolvedSubagentBatch([task], ["delegate", "read"], {
+			runResolved: async () => ({
+				...batchResult(task),
+				observedOutputBytes: 48 * 1024,
+			}),
+		});
+		expect(result.status).toBe("completed");
+		expect(result.items[0]?.result.observedOutputBytes).toBe(48 * 1024);
+		expect(result).not.toHaveProperty("budget");
+	});
+
+	it("rejects removed aggregate output budgets before launching tasks", async () => {
+		const cwd = await createWorkspace();
+		const task = resolvedBatchTask(cwd, "removed-output-budget");
+		const runner: Pick<NativeSubagentRunner, "runResolved"> = {
+			runResolved: vi.fn(async () => batchResult(task)),
+		};
+		const removedOption = { totalBudgetBytes: 1 } as unknown as Parameters<typeof runResolvedSubagentBatch>[3];
+		await expect(runResolvedSubagentBatch([task], ["delegate", "read"], runner, removedOption)).rejects.toThrow(
+			/totalBudgetBytes.*removed/i,
 		);
-		expect(result.budget.consumed).toBe(result.budget.total);
-		expect(result.budget.consumed).toBeLessThanOrEqual(result.budget.total);
+		expect(runner.runResolved).not.toHaveBeenCalled();
 	});
 
 	it("rejects the removed aggregate token budget before launching tasks", async () => {
@@ -7545,34 +8153,6 @@ describe("ICE subagent contracts", () => {
 		expect(result.items.every((item) => item.result.status === "cancelled")).toBe(true);
 	});
 
-	it("marks active workers timed out and leaves queued work unlaunched", async () => {
-		const cwd = await createWorkspace();
-		const tasks = ["slow", "queued"].map((id) => resolvedBatchTask(cwd, id));
-		let calls = 0;
-		const runner: Pick<NativeSubagentRunner, "runResolved"> = {
-			runResolved: async (task, _tools, options) => {
-				calls++;
-				const resolvedTask = tasks.find((candidate) => candidate.request.runId === task.runId)!;
-				return new Promise<SubagentResult>((resolve) => {
-					options?.signal?.addEventListener(
-						"abort",
-						() => resolve(batchResult(resolvedTask, "cancelled", "timeout")),
-						{
-							once: true,
-						},
-					);
-				});
-			},
-		};
-		const result = await runResolvedSubagentBatch(tasks, ["delegate", "read"], runner, {
-			concurrency: 1,
-			timeoutMs: 5,
-		});
-		expect(calls).toBe(1);
-		expect(result.status).toBe("timed_out");
-		expect(result.items[1]?.result.status).toBe("timed_out");
-	});
-
 	it("rejects resolved reviewer tasks that do not use self-delegation", async () => {
 		const cwd = await createWorkspace();
 		const fileAgentDir = await mkdtemp(join(tmpdir(), "ice-subagents-file-review-agent-"));
@@ -7645,14 +8225,13 @@ describe("ICE subagent contracts", () => {
 		const preflight = buildSubagentLaunchPreflight(assigned, ["read", "grep"], {
 			batchId: "batch-1",
 			concurrency: 2,
-			totalBudgetBytes: 64 * 1024,
 		});
 		expect(preflight).toMatchObject({
 			batchId: "batch-1",
 			taskCount: 2,
 			concurrency: 2,
-			budget: { totalOutputBytes: 64 * 1024, reservedOutputBytes: 2 * 24 * 1024 },
 		});
+		expect(preflight).not.toHaveProperty("budget");
 		expect(preflight.tasks.map((task) => task.taskId)).toEqual(["parent", "security"]);
 		expect(preflight.tasks[0]?.model).toEqual({ resolved: "provider/parent", source: "parent" });
 		expect(preflight.tasks[1]?.model).toEqual({ resolved: "provider/parent", source: "parent" });
@@ -7778,11 +8357,7 @@ describe("ICE subagent contracts", () => {
 		expect(result.preflight.tasks.map((task) => task.taskId)).toEqual(["one", "two"]);
 		expect(result.preflight.tasks.map((task) => task.model.resolved)).toEqual(["provider/parent", "provider/parent"]);
 		expect(result.preflight.tasks.map((task) => task.tools)).toEqual([["read"], ["read"]]);
-		expect(result.preflight.budget).toEqual({
-			totalOutputBytes: 256 * 1024,
-			reservedOutputBytes: 2 * 24 * 1024,
-			maxPotentialOutputBytes: 4 * 24 * 1024,
-		});
+		expect(result.preflight).not.toHaveProperty("budget");
 		expect(result.preflight.recovery).toEqual({
 			maxAttempts: 2,
 			sameModel: true,
@@ -7908,7 +8483,7 @@ describe("ICE subagent contracts", () => {
 			unsafeHostExec: true,
 		});
 		expect(result.status).toBe("failed");
-		expect(result.budget.reserved).toBe(0);
+		expect(result).not.toHaveProperty("budget");
 		expect(runner.runResolved).toHaveBeenCalledOnce();
 	});
 
@@ -8042,13 +8617,60 @@ describe("ICE subagent contracts", () => {
 				properties: expect.objectContaining({ role: expect.any(Object), task: expect.any(Object) }),
 			}),
 		});
+		for (const name of ["delegate", "delegate_async"]) {
+			const schema = tools.get(name)?.parameters;
+			expect(
+				Value.Check(schema, { role: "explore", task: "Inspect.", scope: { roots: ["."] }, startupTimeoutMs: 1000 }),
+			).toBe(true);
+			expect(
+				Value.Check(schema, { role: "explore", task: "Inspect.", scope: { roots: ["."] }, timeoutMs: 1000 }),
+			).toBe(false);
+		}
 		expect(tools.get("inspect_subagent_job")?.parameters).toMatchObject({
 			properties: { jobId: { type: "string", minLength: 1, maxLength: 128 } },
 		});
 		expect(tools.get("cancel_subagent_job")?.parameters).toMatchObject({
 			properties: { jobId: { type: "string", minLength: 1, maxLength: 128 } },
 		});
-		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("background");
+		const outputReader = tools.get("read_subagent_output");
+		expect(outputReader).toMatchObject({ name: "read_subagent_output" });
+		expect(outputReader?.parameters).toMatchObject({
+			additionalProperties: false,
+			properties: {
+				artifactId: { type: "string", minLength: 36, maxLength: 36 },
+				offset: { type: "integer", minimum: 0 },
+				length: { type: "integer", minimum: 1, maximum: 64 * 1024 },
+			},
+		});
+		expect(
+			Value.Check(outputReader?.parameters, {
+				artifactId: "00000000-0000-4000-8000-000000000000",
+				offset: 0,
+				length: 16 * 1024,
+			}),
+		).toBe(true);
+		expect(
+			Value.Check(outputReader?.parameters, {
+				artifactId: "00000000-0000-4000-8000-000000000000",
+				path: "/tmp/output.txt",
+			}),
+		).toBe(false);
+		for (const name of ["delegate", "delegate_async", "delegate_batch", "review_batch", "delegate_write"]) {
+			expect(tools.get(name)?.parameters.properties).not.toHaveProperty("background");
+			expect(tools.get(name)?.description).not.toMatch(/background:\s*false/);
+		}
+		const delegateSchema = tools.get("delegate")?.parameters;
+		const delegateCall = { role: "self", task: "Inspect.", scope: { roots: ["src"] } };
+		expect(Value.Check(delegateSchema, delegateCall)).toBe(true);
+		expect(Value.Check(delegateSchema, { ...delegateCall, background: false })).toBe(false);
+		expect(
+			Value.Check(tools.get("delegate_write")?.parameters, {
+				task: "Edit.",
+				baseCommit: "a".repeat(40),
+				scope: { roots: ["src"] },
+				background: false,
+			}),
+		).toBe(false);
 		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("queue");
 		expect(tools.get("delegate_async")?.parameters.properties).not.toHaveProperty("plannedOutputBytes");
 		for (const name of ["delegate", "delegate_async", "delegate_batch", "review_batch"]) {
@@ -8065,7 +8687,7 @@ describe("ICE subagent contracts", () => {
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown>();
 		const settingsManager = SettingsManager.inMemory({
 			ice: {
-				subagents: { defaults: { timeoutMs: 9_000 }, roleDefaults: { security: { thinking: "high" } } },
+				subagents: { defaults: { startupTimeoutMs: 9_000 }, roleDefaults: { security: { thinking: "high" } } },
 				hooks: {
 					enabled: true,
 					definitions: [{ id: "policy", event: "subagent.beforeLaunch", kind: "in-process" }],
@@ -8333,23 +8955,30 @@ describe("ICE subagent contracts", () => {
 					return fauxAssistantMessage('{"summary":"context applied","evidence":{"paths":["src"]}}');
 				},
 			]);
-			const result = await harness.tools.get("delegate").execute(
-				"hook-context",
-				{
-					role: "self",
-					self: {
-						instructions: "Inspect the approved scope and report evidence.",
-						capabilities: ["read", "grep", "find", "ls"],
-					},
-					task: "Inspect the source tree.",
-					scope: { roots: ["src"] },
-				},
-				undefined,
-				undefined,
+			const result = await settleManagedDelegate(
+				harness.tools,
 				harness.context,
+				await harness.tools.get("delegate").execute(
+					"hook-context",
+					{
+						role: "self",
+						self: {
+							instructions: "Inspect the approved scope and report evidence.",
+							capabilities: ["read", "grep", "find", "ls"],
+						},
+						task: "Inspect the source tree.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
 			);
 			expect(result).toMatchObject({ isError: false });
 			expect(contexts.some((context) => JSON.stringify(context.messages).includes("hook note"))).toBe(true);
+			expect(contexts.some((context) => JSON.stringify(context.messages).includes("no lifetime timeout"))).toBe(
+				true,
+			);
 			const launch = (result.details as { launch?: { execution?: { tools?: readonly string[] } } }).launch;
 			expect(launch?.execution?.tools ?? []).not.toContain("bash");
 		} finally {
@@ -8782,7 +9411,7 @@ describe("ICE subagent contracts", () => {
 		}
 	});
 
-	it("passes planned output reservations through delegate_async", async () => {
+	it("reports scheduling without planned output reservations through delegate_async", async () => {
 		const harness = await createAsyncToolHarness();
 		try {
 			harness.faux.setResponses([fauxAssistantMessage('{"summary":"reserved fact","evidence":{"paths":["src"]}}')]);
@@ -8816,9 +9445,9 @@ describe("ICE subagent contracts", () => {
 			expect(inspected).toMatchObject({
 				details: {
 					inspection: {
-						budget: {
-							plannedOutputBytes: 24 * 1024,
-							ownerReservedOutputBytes: 0,
+						scheduling: {
+							ownerActiveJobs: 0,
+							ownerQueuedJobs: 0,
 						},
 					},
 				},
@@ -8878,6 +9507,84 @@ describe("ICE subagent contracts", () => {
 					},
 				},
 			});
+		} finally {
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
+			harness.faux.unregister();
+		}
+	});
+
+	it("reads large final output through the shared owner-scoped parent tool", async () => {
+		const harness = await createAsyncToolHarness();
+		const finalAnswer = "large final answer 🌿\\n".repeat(900);
+		try {
+			harness.faux.setResponses([fauxAssistantMessage(finalAnswer)]);
+			const launched = await settleManagedDelegate(
+				harness.tools,
+				harness.context,
+				await harness.tools.get("delegate")!.execute(
+					"read-output-launch",
+					{
+						role: "self",
+						self: {
+							instructions: "Inspect the approved scope and report the requested fact.",
+							capabilities: ["read"],
+						},
+						task: "Inspect the source tree and return the final answer.",
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					harness.context,
+				),
+			);
+			expect(launched).toMatchObject({ isError: false });
+			const result = (launched.details as { result: SubagentResult }).result;
+			expect(result.output).toMatchObject({
+				captureStatus: "artifact_complete",
+				artifact: { schemaVersion: 2, truncated: false },
+			});
+			const artifactId = result.output!.artifact!.id;
+			expect(artifactId).not.toBe(result.runId);
+			expect(result.output!.artifact).not.toHaveProperty("path");
+
+			const readTool = harness.tools.get("read_subagent_output")!;
+			const read = await readTool.execute(
+				"read-output",
+				{ artifactId, length: 64 * 1024 },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(read).toMatchObject({ isError: false });
+			expect(read.details).toMatchObject({
+				output: {
+					artifactId,
+					text: finalAnswer,
+					totalBytes: Buffer.byteLength(finalAnswer),
+					eof: true,
+				},
+			});
+			expect(read.content[0]?.text).toContain(`nextOffset=${Buffer.byteLength(finalAnswer)}`);
+
+			const foreignContext = {
+				...harness.context,
+				sessionManager: {
+					getSessionId: () => "owner-b",
+					getLeafId: () => "leaf-b",
+					getEntries: harness.getEntries,
+				},
+			} as unknown as ExtensionContext;
+			const foreign = await readTool.execute("read-foreign", { artifactId }, undefined, undefined, foreignContext);
+			const unknown = await readTool.execute(
+				"read-unknown",
+				{ artifactId: "00000000-0000-4000-8000-000000000000" },
+				undefined,
+				undefined,
+				harness.context,
+			);
+			expect(foreign).toMatchObject({ isError: true, details: { error: { code: "artifact_not_found" } } });
+			expect(unknown).toMatchObject({ isError: true, details: { error: { code: "artifact_not_found" } } });
+			expect(foreign.content[0]?.text).toBe(unknown.content[0]?.text);
 		} finally {
 			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, harness.context);
 			harness.faux.unregister();
@@ -8946,7 +9653,14 @@ describe("ICE subagent contracts", () => {
 			source: request.source,
 			status: "completed" as const,
 			summary: "async fact",
-			observedOutputBytes: 10,
+			output: {
+				text: "async fact",
+				textBytes: Buffer.byteLength("async fact"),
+				originalBytes: Buffer.byteLength("async fact"),
+				inlineTruncated: false,
+				captureStatus: "inline_complete" as const,
+			},
+			observedOutputBytes: Buffer.byteLength("async fact"),
 			partial: false,
 			diagnostics: [],
 			evidence: { paths: ["src"] },
@@ -9427,17 +10141,18 @@ describe("ICE subagent contracts", () => {
 		});
 	});
 
-	it("exposes bounded batch budget and fail-fast controls", () => {
+	it("exposes batch fail-fast without a caller output budget", () => {
 		const registerTool = vi.fn();
 		iceSubagents({ on: vi.fn(), registerTool } as unknown as ExtensionAPI);
 		const tool = registerTool.mock.calls.find((call) => call[0]?.name === "delegate_batch")?.[0];
 		expect(tool.parameters).toMatchObject({
 			properties: {
-				totalBudgetBytes: { type: "integer" },
 				failFast: { type: "boolean" },
 			},
 		});
 		expect(tool.parameters.properties.tasks.items.properties.contextPacket).toMatchObject({ type: "object" });
+		expect(tool.parameters.properties).not.toHaveProperty("totalBudgetBytes");
+		expect(tool.parameters.additionalProperties).toBe(false);
 	});
 
 	it("exposes bounded configurable role and resource selections", () => {
@@ -9546,6 +10261,13 @@ describe("ICE subagent contracts", () => {
 			source: "self",
 			status: "completed",
 			summary: "Found the requested implementation fact.",
+			output: {
+				text: "Found the requested implementation fact.",
+				textBytes: Buffer.byteLength("Found the requested implementation fact."),
+				originalBytes: Buffer.byteLength("Found the requested implementation fact."),
+				inlineTruncated: false,
+				captureStatus: "inline_complete",
+			},
 			observedOutputBytes: Buffer.byteLength("Found the requested implementation fact."),
 			partial: false,
 			diagnostics: [],
@@ -9645,7 +10367,7 @@ describe("ICE subagent contracts", () => {
 			[{ observedOutputBytes: -1 }, /invalid/i],
 			[{ observedOutputBytes: Number.NaN }, /invalid/i],
 			[{ observedOutputBytes: Number.POSITIVE_INFINITY }, /invalid/i],
-			[{ observedOutputBytes: normalized.maxOutputBytes + 1 }, /cap/i],
+			[{ output: { ...result.output!, textBytes: -1 } }, /bounded output projection/i],
 			[{ evidence: { paths: ["missing-evidence.txt"] } }, /does not exist/i],
 		];
 		for (const [change, reason] of cases) {

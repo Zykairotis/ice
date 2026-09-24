@@ -66,6 +66,7 @@ const MANAGEMENT_TOOLS = new Set([
 	"integrate_writer_patch",
 	"inspect_writer_patch",
 	"reject_writer_patch",
+	"read_subagent_output",
 	"read_plan",
 	"set_active_tools",
 	"set_model",

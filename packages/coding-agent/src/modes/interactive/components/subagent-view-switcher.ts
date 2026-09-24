@@ -9,6 +9,7 @@ import {
 } from "@zykairotis/ice-tui";
 import type { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { IceAgentViewBridge, IceAgentViewDescriptor } from "../../../ice-agent-view-bridge.ts";
+import type { SubagentCheckInState } from "../../../ice-subagent-checkin.ts";
 import type {
 	SubagentRuntimeAttention,
 	SubagentToolActivityOutcome,
@@ -34,9 +35,6 @@ export interface SubagentFooterAttention {
 	readonly phase: SubagentRuntimeAttention["phase"];
 	readonly state: SubagentRuntimeAttention["state"];
 	readonly activeElapsedMs: number;
-	readonly activeBudgetMs: number;
-	readonly totalExtendedMs: number;
-	readonly remainingExtendableMs: number;
 	readonly recentActivities: readonly SubagentFooterActivity[];
 	readonly repeatedFailureCount?: number;
 }
@@ -50,6 +48,7 @@ export interface SubagentFooterEntry {
 	readonly status: string;
 	readonly needsAttention: boolean;
 	readonly attention?: SubagentFooterAttention;
+	readonly checkIn?: SubagentCheckInState;
 }
 
 export interface SubagentFooterSnapshot {
@@ -57,6 +56,7 @@ export interface SubagentFooterSnapshot {
 	readonly liveCount: number;
 	readonly retainedCount: number;
 	readonly attentionCount: number;
+	readonly mainAgentDisplayed: boolean;
 	readonly selectedChild?: SubagentFooterEntry;
 	readonly selectedChildIndex?: number;
 }
@@ -86,15 +86,8 @@ function formatFooterActivity(activity: SubagentFooterActivity): string {
 }
 
 function formatFooterTiming(attention: SubagentFooterAttention): string | undefined {
-	if (attention.activeBudgetMs <= 0) return undefined;
 	const elapsedSeconds = Math.floor(attention.activeElapsedMs / 1000);
-	const remainingSeconds =
-		attention.state === "awaiting_extension"
-			? Math.floor(attention.remainingExtendableMs / 1000)
-			: Math.max(0, Math.floor((attention.activeBudgetMs - attention.activeElapsedMs) / 1000));
-	const remainingLabel = attention.state === "awaiting_extension" ? "extendable" : "left";
-	const extension = attention.totalExtendedMs > 0 ? ` · +${Math.floor(attention.totalExtendedMs / 1000)}s` : "";
-	return `${elapsedSeconds}s elapsed · ${remainingSeconds}s ${remainingLabel}${extension}`;
+	return `${elapsedSeconds}s elapsed · check-ins active`;
 }
 
 function footerAttention(view: IceAgentViewDescriptor): SubagentFooterAttention | undefined {
@@ -116,12 +109,19 @@ function footerAttention(view: IceAgentViewDescriptor): SubagentFooterAttention 
 		phase: runtime.phase,
 		state: runtime.state,
 		activeElapsedMs: runtime.activeElapsedMs,
-		activeBudgetMs: runtime.activeBudgetMs,
-		totalExtendedMs: runtime.totalExtendedMs,
-		remainingExtendableMs: runtime.remainingExtendableMs,
 		recentActivities,
 		...(runtime.repeatedFailure ? { repeatedFailureCount: runtime.repeatedFailure.count } : {}),
 	});
+}
+
+function formatFooterCheckIn(state: SubagentCheckInState | undefined): string | undefined {
+	if (!state) return undefined;
+	if (state.delivery === "owner_unavailable") return "check-in overdue; owner unavailable";
+	if (state.delivery === "due") return "check-in overdue; awaiting parent";
+	if (state.delivery === "queued_for_parent") return "check-in pending parent review";
+	if (state.delivery === "consumed") return "parent reviewing check-in";
+	if (state.delivery === "acknowledged") return "check-in acknowledged";
+	return state.nextDueAt === undefined ? "check-in armed" : `check-in due ${new Date(state.nextDueAt).toISOString()}`;
 }
 
 function footerStatus(view: IceAgentViewDescriptor, attention: SubagentFooterAttention | undefined): string {
@@ -137,12 +137,14 @@ function footerStatus(view: IceAgentViewDescriptor, attention: SubagentFooterAtt
 function hasFooterAttention(view: IceAgentViewDescriptor, attention: SubagentFooterAttention | undefined): boolean {
 	if (!view.live) return false;
 	return (
-		view.controlState === "awaiting-extension" ||
 		view.controlState === "awaiting-finalization" ||
 		view.controlState === "final-report-requested" ||
-		attention?.state === "awaiting_extension" ||
 		attention?.phase === "finalization" ||
-		attention?.repeatedFailureCount !== undefined
+		attention?.repeatedFailureCount !== undefined ||
+		view.checkIn?.delivery === "due" ||
+		view.checkIn?.delivery === "queued_for_parent" ||
+		view.checkIn?.delivery === "consumed" ||
+		view.checkIn?.delivery === "owner_unavailable"
 	);
 }
 
@@ -169,19 +171,21 @@ export function createSubagentFooterSnapshot(
 					status: footerStatus(view, attention),
 					needsAttention: hasFooterAttention(view, attention),
 					...(attention ? { attention } : {}),
+					...(view.checkIn ? { checkIn: view.checkIn } : {}),
 				});
 			}),
 	);
 	const liveCount = children.filter((view) => view.live).length;
+	const mainAgentDisplayed = views.some((view) => view.id === displayedId && view.kind === "parent");
 	const selectedChild =
 		children.find((view) => view.id === displayedId) ??
-		children.find((view) => view.id === selectedViewId) ??
-		children[0];
+		(mainAgentDisplayed ? undefined : (children.find((view) => view.id === selectedViewId) ?? children[0]));
 	return Object.freeze({
 		children,
 		liveCount,
 		retainedCount: children.filter((view) => view.retentionState === "reusable").length,
 		attentionCount: children.filter((view) => view.needsAttention).length,
+		mainAgentDisplayed,
 		...(selectedChild
 			? {
 					selectedChild,
@@ -230,6 +234,7 @@ export class SubagentFooterSwitcher implements Component {
 		liveCount: 0,
 		retainedCount: 0,
 		attentionCount: 0,
+		mainAgentDisplayed: false,
 	});
 
 	constructor(
@@ -279,8 +284,7 @@ export class SubagentFooterSwitcher implements Component {
 			return viewing ? this.theme.fg(view.color ?? "accent", text) : this.theme.fg(view.color ?? "muted", text);
 		const footerView = this.footerSnapshot.children.find((entry) => entry.id === view.id);
 		if (footerView?.needsAttention) return applyTextPresentation(this.appearance.attention, text);
-		if (view.kind === "subagent" && view.live && view.controlState === "awaiting-extension")
-			return applyTextPresentation(this.appearance.attention, text);
+
 		const status = String(view.status ?? "").toLowerCase();
 		if (status.includes("fail") || status.includes("error"))
 			return applyTextPresentation(this.appearance.failed, text);
@@ -318,6 +322,14 @@ export class SubagentFooterSwitcher implements Component {
 			this.close();
 			return;
 		}
+		if (this.keybindings.matches(data, "app.subagents.next")) {
+			this.cycleDisplayedView(1);
+			return;
+		}
+		if (this.keybindings.matches(data, "app.subagents.previous")) {
+			this.cycleDisplayedView(-1);
+			return;
+		}
 		if (this.keybindings.matches(data, "tui.select.up") || matchesKey(data, Key.up) || matchesKey(data, Key.left)) {
 			this.moveSelection(-1);
 			return;
@@ -329,35 +341,6 @@ export class SubagentFooterSwitcher implements Component {
 		) {
 			this.moveSelection(1);
 			return;
-		}
-		const selected = this.views[this.selectedIndex];
-		if (selected?.kind === "subagent" && selected.live && selected.controlState === "awaiting-extension") {
-			if (data === "e" || data === "E") {
-				const attention = this.bridge.getRuntimeAttention(selected.id);
-				const preferredMs = attention?.phase === "finalization" ? 30_000 : 60_000;
-				const additionalMs = Math.min(preferredMs, attention?.remainingExtendableMs ?? preferredMs);
-				if (additionalMs < 1_000) {
-					this.actionMessage = "No extension budget remains";
-					this.tui.requestRender();
-					return;
-				}
-				this.actionMessage = `Extending ${Math.round(additionalMs / 1000)}s…`;
-				void this.bridge.extendRuntime(selected.id, additionalMs).catch((error) => {
-					this.actionMessage = error instanceof Error ? error.message : String(error);
-					this.tui.requestRender();
-				});
-				this.tui.requestRender();
-				return;
-			}
-			if (data === "x" || data === "X") {
-				this.actionMessage = "Stopping subagent…";
-				void this.bridge.stopRuntime(selected.id).catch((error) => {
-					this.actionMessage = error instanceof Error ? error.message : String(error);
-					this.tui.requestRender();
-				});
-				this.tui.requestRender();
-				return;
-			}
 		}
 		if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
 			const selected = this.views[this.selectedIndex];
@@ -386,6 +369,13 @@ export class SubagentFooterSwitcher implements Component {
 		this.tui.requestRender();
 	}
 
+	private cycleDisplayedView(delta: -1 | 1): void {
+		if (!this.bridge.cycleDisplayed(delta)) return;
+		const displayedIndex = this.views.findIndex((view) => view.id === this.bridge.getDisplayedId());
+		if (displayedIndex >= 0) this.selectedIndex = displayedIndex;
+		this.tui.requestRender();
+	}
+
 	private refreshViews(initial: boolean): void {
 		const previousId = this.views[this.selectedIndex]?.id;
 		const displayedId = this.bridge.getDisplayedId();
@@ -409,7 +399,11 @@ export class SubagentFooterSwitcher implements Component {
 		]
 			.filter((part): part is string => part !== undefined)
 			.join(" · ");
-		const selectedSummary = selected ? ` · [${selectedPosition} ${selected.label}] ${selected.status}` : "";
+		const selectedSummary = snapshot.mainAgentDisplayed
+			? " · [Main agent] MAIN"
+			: selected
+				? ` · [${selectedPosition} ${selected.label}] ${selected.status}`
+				: "";
 		const summary = `Agents ${counts}${selectedSummary} · /agents`;
 		const countOnly = [
 			`Agents ${snapshot.children.length}`,
@@ -425,6 +419,7 @@ export class SubagentFooterSwitcher implements Component {
 						? selected.attention.recentActivities.map(formatFooterActivity).join(" · ")
 						: undefined,
 					selected.attention ? formatFooterTiming(selected.attention) : undefined,
+					formatFooterCheckIn(selected.checkIn),
 					selected.attention?.repeatedFailureCount !== undefined
 						? `${selected.attention.repeatedFailureCount} recent failures`
 						: undefined,
@@ -469,12 +464,11 @@ export class SubagentFooterSwitcher implements Component {
 			const suffix = viewing ? " · viewing" : "";
 			const footerView = this.footerSnapshot.children.find((entry) => entry.id === view.id);
 			const attention = footerView?.attention;
-			const time = attention?.activeBudgetMs
-				? ` · ${Math.floor(attention.activeElapsedMs / 1000)}/${Math.floor(attention.activeBudgetMs / 1000)}s`
-				: "";
+			const time = attention ? ` · ${Math.floor(attention.activeElapsedMs / 1000)}s` : "";
 			const latestActivity = attention?.recentActivities.at(-1);
 			const activity = selected && latestActivity ? ` · ${formatFooterActivity(latestActivity)}` : "";
-			const status = `${footerView?.status ?? agentSwitcherStatus(view)}${time}${activity}${suffix}`;
+			const checkIn = formatFooterCheckIn(footerView?.checkIn);
+			const status = `${footerView?.status ?? agentSwitcherStatus(view)}${time}${activity}${checkIn ? ` · ${checkIn}` : ""}${suffix}`;
 			const prefix = `  ${selectionMarker} ${typeMarker} `;
 			const statusWidth = Math.min(30, Math.max(12, visibleWidth(status)));
 			const labelWidth = Math.max(1, width - visibleWidth(prefix) - statusWidth - 2);
@@ -490,20 +484,12 @@ export class SubagentFooterSwitcher implements Component {
 			hiddenBefore || hiddenAfter
 				? ` · ${hiddenBefore ? `↑${hiddenBefore}` : ""}${hiddenBefore && hiddenAfter ? " " : ""}${hiddenAfter ? `↓${hiddenAfter}` : ""}`
 				: "";
-		const selectedView = this.views[this.selectedIndex];
-		const attentionHint =
-			selectedView?.kind === "subagent" && selectedView.live && selectedView.controlState === "awaiting-extension"
-				? " · E extend · X stop"
-				: "";
 		const actionHint = this.actionMessage ? ` · ${this.actionMessage}` : "";
 		lines.push(
 			(this.isCustomized() && this.appearance
 				? (text: string) => applyTextPresentation(this.appearance!.muted, text)
 				: (text: string) => this.theme.fg("dim", text))(
-				padVisible(
-					`  ↑↓/←→ browse · Enter open${attentionHint} · Esc close · /agents split details${hidden}${actionHint}`,
-					width,
-				),
+				padVisible(`  ↑↓/←→ browse · Enter open · Esc close · /agents split details${hidden}${actionHint}`, width),
 			),
 		);
 		return lines;
@@ -516,21 +502,18 @@ export class SubagentFooterSwitcher implements Component {
 		const typeMarker = view.kind === "parent" ? "◆" : view.live ? "●" : "○";
 		const marker = displayed ? "●" : ">";
 		const footerView = this.footerSnapshot.children.find((entry) => entry.id === view.id);
-		const status = `${footerView?.status ?? agentSwitcherStatus(view)}${displayed ? " · viewing" : ""}`;
+		const checkIn = formatFooterCheckIn(footerView?.checkIn);
+		const status = `${footerView?.status ?? agentSwitcherStatus(view)}${checkIn ? ` · ${checkIn}` : ""}${displayed ? " · viewing" : ""}`;
 		const row = `Agents  ${marker} ${typeMarker} ${formatAgentSwitcherLabel(view)}  ${status}`;
 		const styledRow = this.styleView(view, padVisible(row, width), displayed);
-		const attentionHint =
-			view.kind === "subagent" && view.live && view.controlState === "awaiting-extension"
-				? " · E extend · X stop"
-				: "";
 		return [
 			styledRow,
 			this.isCustomized() && this.appearance
 				? applyTextPresentation(
 						this.appearance.muted,
-						padVisible(`        ↑↓/←→ browse · Enter open${attentionHint} · Esc close`, width),
+						padVisible(`        ↑↓/←→ browse · Enter open · Esc close`, width),
 					)
-				: this.theme.fg("dim", padVisible(`        ↑↓/←→ browse · Enter open${attentionHint} · Esc close`, width)),
+				: this.theme.fg("dim", padVisible(`        ↑↓/←→ browse · Enter open · Esc close`, width)),
 		];
 	}
 }

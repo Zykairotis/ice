@@ -7,17 +7,17 @@ Ice remains the only reasoning/tool loop. These controls belong to `ice`; ordina
 | Tool | Use |
 |---|---|
 | `list_subagent_profiles` | Discover file agents, self-delegation, sources, effective capabilities, and diagnostics |
-| `delegate` | One foreground file-agent or self-delegated (role self) investigation |
+| `delegate` | One file-agent or self-delegated (role self) investigation; defaults to a managed background handle |
 | `delegate_async` | Owner-scoped durable background investigation |
 | `delegate_batch` | Up to eight independently scoped sibling tasks |
 | `review_batch` | Independent correctness/security/tests/regression reviewers |
-| `manage_subagent` | Inspect, follow up, extend, stop, resume, or delete an eligible retained foreground run |
+| `manage_subagent` | Inspect, peek, wait, follow up, stop, resume, or delete an eligible retained child or writer run |
 | `inspect_subagent_job`, `cancel_subagent_job` | Inspect/cancel owned background jobs |
 | `delegate_write` | Separate build-only isolated writer workflow |
 
 Delegation is for fan-out: use these tools only when the work splits into two or more children. Do a simple single task directly in the parent loop instead of delegating it, and never wrap a lone task in a one-item batch.
 
-Background jobs are not restart-resumable live sessions. Restart preserves inspectable terminal/interrupted state and never automatically relaunches ambiguous work. Foreground follow-up reuses the native child, requires an owner-bound run ID and stable request ID, and rejects user-takeover conflicts. An eligible completed foreground child is also retained as a live reusable session (bounded to 8 per runner, oldest terminal child evicted and released) so `resume` can continue it in place and `delete` can release it; `resume` mints a new run id with `resumedFromRunId` provenance, re-validates profile/resources/trust/tool authority fail-closed at the resume boundary, re-points the reused session's tool, stream, and turn-stop wrappers at the resumed run's hooks, authority callback, and bounded execution controls, and cannot widen the original model, profile, scope, or tools.
+By default, `delegate`, `delegate_batch`, and `review_batch` return owner-scoped handles after launch preflight/admission instead of keeping the parent tool call open for child completion. The parent can continue unrelated work and inspect a batch/review aggregate with `inspect_subagent_batch`; `cancel_subagent_batch` stops the aggregate. `delegate_write` also defaults to a managed handle, but only after clean-parent/base-commit checks and isolated-worktree setup succeed. Managed delegates, batch/review siblings, writers, and `delegate_async` jobs use advisory owner-session check-ins no more frequently than every 120 seconds; they have no child lifetime deadline. Check-ins are coalesced through the existing parent AgentSession, re-armed after consumption and settlement, and do not interrupt the parent or stop children. An overdue notice, stale progress, failed parent review, or unavailable owner never fails/stops the child. Use `manage_subagent` to inspect/follow up/wait/stop a foreground child or writer; batch/review handles use the aggregate inspect/cancel tools and their child run IDs remain individually manageable. Set `background: false` only for an explicit synchronous wait; that legacy path retains a bounded workflow timeout while migration is completed. Durable jobs are not restart-resumable live sessions: restart preserves inspectable terminal/interrupted state and never relaunches ambiguous work. Foreground follow-up reuses the native child, requires an owner-bound run ID and stable request ID, and rejects user-takeover conflicts. An eligible completed foreground child is also retained as a live reusable session (bounded to 8 per runner, oldest terminal child evicted and released) so `resume` can continue it in place and `delete` can release it; `resume` mints a new run id with `resumedFromRunId` provenance, re-validates profile/resources/trust/tool authority fail-closed at the resume boundary, re-points the reused session's tool, stream, and turn-stop wrappers at the resumed run's hooks, authority callback, and bounded execution controls, and cannot widen the original model, profile, scope, or tools.
 
 ## Self-delegation: no file required
 
@@ -28,7 +28,7 @@ Ask the parent to delegate an investigation, or use these `delegate` tool argume
   "role": "self",
   "task": "Inspect the implementation and return verified file evidence.",
   "scope": { "roots": ["src"] },
-  "timeoutMs": 120000,
+  "checkInIntervalMs": 120000,
   "execution": { "maxOutputBytes": 16384 },
   "contextMode": "fresh"
 }
@@ -55,7 +55,7 @@ Inspect the requested API surface. Return concrete findings with existing in-sco
 Distinguish verified behavior, risks, and unrun checks. Do not claim edits or passing tests without evidence.
 ```
 
-Use lowercase kebab-case names. Unknown profile metadata is rejected. Supported operational fields include tools, `adapters` (explicit parent-owned adapter IDs, for example `adapters: [example/workspace-info]`), tags, thinking/thinkingLevel, timeout/timeoutMs, max-output-bytes, temperature, top-p, `color` (a bounded semantic theme token), `hidden`, skills, prompts, context, optional `hooks` IDs, exact `model`/`fallbackModel` references, and explicit `mcp` server/tool selectors (for example `mcp: [search/docs]`). Import provenance fields are retained. Models follow the deterministic order: explicit call model, else file primary, else file fallback, else the captured parent (duplicates collapse; omitted fields reach the parent). Each configured candidate is resolved through Ice's catalog with existing-auth, text input, usable context/output metadata, explicit reasoning requirements, and route-policy checks; availability failures advance with a bounded skip reason while policy denials reject the launch. Selected MCP tools are opt-in and dispatch only through the parent-owned adapter with hooks, timeout, cancellation, and bounded output; without parent authorization the launch fails closed. Global-first precedence applies throughout ice: an explicit call value beats an explicit global value, which beats a trusted-project value, then the profile/bundled default. Denies, mode restrictions, and trust requirements still win over any preference. `hidden` affects discovery only: hidden profiles are omitted from listing/search/suggestions but remain directly resolvable subject to normal trust and policy.
+Use lowercase kebab-case names. Unknown profile metadata is rejected. Supported operational fields include tools, `adapters` (explicit parent-owned adapter IDs, for example `adapters: [example/workspace-info]`), tags, thinking/thinkingLevel, `checkInIntervalMs` (default/minimum 120000 for managed/durable execution), `startupTimeoutMs` for bounded child startup/admission only, max-output-bytes, temperature, top-p, `color` (a bounded semantic theme token), `hidden`, skills, prompts, context, optional `hooks` IDs, exact `model`/`fallbackModel` references, and explicit `mcp` server/tool selectors (for example `mcp: [search/docs]`). Import provenance fields are retained. Models follow the deterministic order: explicit call model, else file primary, else file fallback, else the captured parent (duplicates collapse; omitted fields reach the parent). Each configured candidate is resolved through Ice's catalog with existing-auth, text input, usable context/output metadata, explicit reasoning requirements, and route-policy checks; availability failures advance with a bounded skip reason while policy denials reject the launch. Selected MCP tools are opt-in and dispatch only through the parent-owned adapter with hooks, timeout, cancellation, and bounded output; without parent authorization the launch fails closed. Global-first precedence applies throughout ice: an explicit call value beats an explicit global value, which beats a trusted-project value, then the profile/bundled default. Denies, mode restrictions, and trust requirements still win over any preference. `hidden` affects discovery only: hidden profiles are omitted from listing/search/suggestions but remain directly resolvable subject to normal trust and policy.
 
 Global (user) > trusted project is the file-agent source precedence; bundled roles and aliases were removed. Profile tools are requests: effective tools are narrowed by the parent, execution mode, deny lists, and caller subset. Role expertise does not grant write/Bash/network authority. Source hashes are checked again before use. `review_batch` uses self-delegation with a bounded reviewer snapshot; explicitly named file agents remain available through delegate/delegate_batch.
 
@@ -68,13 +68,13 @@ Example tool arguments:
   "role": "api-review",
   "task": "Review request validation; report concrete defects with evidence.",
   "scope": { "roots": ["packages/coding-agent/src"], "targets": ["packages/coding-agent/src/ice-subagents.ts"] },
-  "timeoutMs": 120000,
+  "checkInIntervalMs": 120000,
   "execution": { "thinking": "low", "tools": ["read", "grep"], "maxOutputBytes": 16384 },
   "contextMode": "fresh"
 }
 ```
 
-Roots are existing directories and are the authority boundary; targets are existing files used as focus. Selected resources add path access only through already-authorized tools. An explicit `execution.tools: []` creates a tool-free child, including no MCP tools; it never restores the full tool set. Final report repair stays within the same timeout, output, authority, and cancellation contract.
+Roots are existing directories and are the authority boundary; targets are existing files used as focus. Selected resources add path access only through already-authorized tools. An explicit `execution.tools: []` creates a tool-free child, including no MCP tools; it never restores the full tool set. Final report repair stays within the same output, authority, and cancellation contract; managed background execution has no lifetime deadline.
 
 Use a bounded `contextPacket` for handoff facts. `fresh` is the default; `fork` is opt-in sanitized history, not a cloned live session. An optional restricted local `outputSchema` validates the nested `payload`; remote references and executable validators are forbidden. Schema validity never overrides evidence or mandatory acceptance failures.
 
@@ -119,21 +119,21 @@ Use existing global `<agentDir>/settings.json` (normally `~/.ice/agent/settings.
   "ice": {
     "subagents": {
       "enabled": true,
-      "defaults": { "timeoutMs": 120000, "maxOutputBytes": 24576 },
-      "restrictions": { "denyTools": ["bash", "edit", "write"], "maxTimeoutMs": 300000 },
+      "defaults": { "checkInIntervalMs": 120000, "startupTimeoutMs": 120000, "maxOutputBytes": 24576 },
+      "restrictions": { "denyTools": ["bash", "edit", "write"], "maxStartupTimeoutMs": 300000 },
       "modelSelection": { "mode": "inherit-parent" }
     }
   }
 }
 ```
 
-Deny wins. Empty allowed-role lists are neutral. Invalid policy blocks admission. Settings changes affect future launches and revoke active/queued authority at safe boundaries rather than silently granting more capability. Timeout and output limits are settings-contract controls; per-child turn and tool-call ceilings are not exposed or enforced. Profile `temperature` is passed through typed stream options when supported; `top-p` is mapped to `top_p` only for OpenAI-compatible adapters. Anthropic temperature and non-OpenAI top-p requests are omitted with a bounded provider-compatibility diagnostic. Sampling preferences apply to work and the bounded final report.
+Deny wins. Empty allowed-role lists are neutral. Invalid policy blocks admission. Settings changes affect future launches and revoke active/queued authority at safe boundaries rather than silently granting more capability. `startupTimeoutMs` and `maxStartupTimeoutMs` bound child session startup only; they do not limit a running child's lifetime. Output limits remain enforced. Per-child turn and tool-call ceilings are not exposed or enforced. Profile `temperature` is passed through typed stream options when supported; `top-p` is mapped to `top_p` only for OpenAI-compatible adapters. Anthropic temperature and non-OpenAI top-p requests are omitted with a bounded provider-compatibility diagnostic. Sampling preferences apply to work and the bounded final report.
 
 ### Usage telemetry and execution limits
 
 Subagent token counts are observational only. `SubagentResult.usage` and related telemetry retain provider-reported input, output, cache-read, cache-write, and cost values when available; they do not authorize or enforce aggregate token ceilings. Provider/runtime failures remain terminal errors, while only explicit cancellation or genuine execution deadlines produce cancellation/timeout results.
 
-Execution remains bounded by the real wall-clock `timeoutMs` and the complete UTF-8 parent-facing `maxOutputBytes` cap. ICE does not expose or enforce per-child model-turn or tool-call ceilings; children may use their approved tools as needed until completion, cancellation, timeout, or output truncation. Batch and review calls also reserve planned output bytes atomically; unused reservations are released on settlement or cancellation. Removed legacy `maxTotalTokens`, `totalTokenBudget`, `maxTurns`, and `maxToolCalls` fields are rejected rather than silently ignored. Durable jobs normalize old persisted snapshots by stripping those removed fields before validation and rewriting the normalized state; they do not resume an in-flight model session after restart.
+Managed `delegate`, `delegate_batch`, `review_batch`, `delegate_write`, and durable `delegate_async` runs are not terminated by a wall-clock lifetime timeout. Their periodic check-ins are advisory, and explicit stop/cancellation/shutdown plus provider, tool, hook, startup, and output limits remain separate safeguards. Startup limits apply only while creating and admitting the child session. ICE does not expose or enforce per-child model-turn or tool-call ceilings; children may use approved tools as needed until completion, cancellation, explicit stop, or output truncation. Batch and review calls reserve planned output bytes atomically; unused reservations are released on settlement or cancellation. Removed legacy `maxTotalTokens`, `totalTokenBudget`, `maxTurns`, and `maxToolCalls` fields are rejected rather than silently ignored. Durable jobs normalize old persisted snapshots by stripping those removed fields before validation and rewriting the normalized state; they do not resume an in-flight model session after restart.
 
 ## Optional child routes
 
@@ -223,7 +223,7 @@ Disable new admissions with `ice.subagents.enabled: false`, then inspect/cancel 
 - **Persistent session required:** omit `--no-session`; no durable hook claim is available in memory-only mode.
 - **Hash changed:** review changes and update approved hashes explicitly; do not auto-accept new bytes.
 - **Route unavailable/capabilities changed:** inspect Ice's configured catalog; do not substitute a different route silently.
-- **Needs time:** inspect and extend/stop the existing eligible child rather than spawning a duplicate.
+- **Check-in overdue:** inspect the same owner-bound run and decide whether to follow up, wait, stop, or continue; overdue/stale status is advisory and does not time out the child.
 - **Verified=false:** preserve failures and evidence. A valid payload or hook approval is not proof of completion.
 
 The implementation plan and reproducible verification packet are in `agent_docs/implementation/subagent-self-delegation-model-fallback-plan.md` and `.artifacts/ice-self-user-ready-20260910/`. The static operator explainer is `html-communication/subagent-user-ready.html`.

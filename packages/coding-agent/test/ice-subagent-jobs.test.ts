@@ -287,7 +287,7 @@ describe("durable subagent jobs", () => {
 		const registry = createRegistry((snapshot) => snapshots.push(snapshot));
 		const contract: SubagentJobContract = {
 			thinking: "medium",
-			timeoutMs: 120_000,
+			checkInIntervalMs: 180_000,
 			maxOutputBytes: 24 * 1024,
 			tools: [],
 		};
@@ -308,13 +308,82 @@ describe("durable subagent jobs", () => {
 			cacheWriteTokens: 1,
 		});
 		expect(snapshots.at(-1)?.result?.usage?.inputTokens).toBe(5);
+		expect(snapshots.at(-1)?.job.contract).toMatchObject({ checkInIntervalMs: 180_000 });
+		expect(snapshots.at(-1)?.job.contract).not.toHaveProperty("timeoutMs");
 		expect(snapshots.at(-1)?.job.contract).not.toHaveProperty("maxTotalTokens");
 	});
 
-	it("normalizes legacy token-budget fields before restoring persisted jobs", () => {
+	it("persists bounded check-in scheduler metadata and clears pending delivery without raw notices", async () => {
+		const snapshots: PersistedSubagentJobSnapshot[] = [];
+		const deferred = deferredRun();
+		const registry = createRegistry((snapshot) => snapshots.push(snapshot));
+		const accepted = launch(registry, deferred.run);
+		await flush();
+
+		expect(
+			registry.updateCheckInState(accepted.jobId, {
+				sequence: 3,
+				lastAcknowledgedAt: 1_000,
+				pendingSince: 2_000,
+				overdueSince: 2_000,
+			}),
+		).toBe(true);
+		expect(registry.inspect(accepted.jobId).job.checkIn).toEqual({
+			sequence: 3,
+			lastAcknowledgedAt: 1_000,
+			pendingSince: 2_000,
+			overdueSince: 2_000,
+		});
+		expect(snapshots.at(-1)?.job.checkIn).toEqual({
+			sequence: 3,
+			lastAcknowledgedAt: 1_000,
+			pendingSince: 2_000,
+			overdueSince: 2_000,
+		});
+		expect(JSON.stringify(snapshots.at(-1))).not.toContain("noticeId");
+
+		expect(registry.updateCheckInState(accepted.jobId, undefined)).toBe(true);
+		expect(registry.inspect(accepted.jobId).job.checkIn).toEqual({
+			sequence: 3,
+			lastAcknowledgedAt: 1_000,
+		});
+		deferred.settle();
+		await flush();
+	});
+
+	it("clears persisted pending/overdue check-in state when restart interrupts a live job", () => {
+		const snapshots: PersistedSubagentJobSnapshot[] = [];
+		const running = persistedSnapshot("checkin-restart", "running") as PersistedSubagentJobSnapshot & {
+			job: PersistedSubagentJobSnapshot["job"] & {
+				checkIn: {
+					sequence: number;
+					lastAcknowledgedAt: number;
+					pendingSince: number;
+					overdueSince: number;
+				};
+			};
+		};
+		running.job.checkIn = {
+			sequence: 4,
+			lastAcknowledgedAt: 1_000,
+			pendingSince: 2_000,
+			overdueSince: 2_000,
+		};
+		const registry = createRegistry((snapshot) => snapshots.push(snapshot));
+		registry.restore([{ type: "custom", customType: JOB_ENTRY_TYPE, data: running }]);
+
+		const inspection = registry.inspect("checkin-restart");
+		expect(inspection.job.status).toBe("interrupted");
+		expect(inspection.job.checkIn).toEqual({ sequence: 4, lastAcknowledgedAt: 1_000 });
+		expect(snapshots.at(-1)?.job.checkIn).toEqual({ sequence: 4, lastAcknowledgedAt: 1_000 });
+	});
+
+	it("normalizes legacy token and output-budget fields before restoring persisted jobs", () => {
 		const snapshots: PersistedSubagentJobSnapshot[] = [];
 		const legacy = persistedSnapshot("legacy-token-budget", "completed") as unknown as Record<string, unknown>;
 		const legacyJob = legacy.job as Record<string, unknown>;
+		legacyJob.plannedOutputBytes = 24 * 1024;
+		legacyJob.reservedOutputBytes = 0;
 		legacyJob.contract = {
 			thinking: "medium",
 			timeoutMs: 120_000,
@@ -329,11 +398,15 @@ describe("durable subagent jobs", () => {
 		const registry = createRegistry((snapshot) => snapshots.push(snapshot));
 		registry.restore([{ type: "custom", customType: JOB_ENTRY_TYPE, data: legacy }]);
 		const inspection = registry.inspect("legacy-token-budget");
+		expect(inspection.job).not.toHaveProperty("plannedOutputBytes");
+		expect(inspection.job).not.toHaveProperty("reservedOutputBytes");
 		expect(inspection.job.contract).not.toHaveProperty("maxTotalTokens");
 		expect(inspection.job.contract).not.toHaveProperty("maxTurns");
 		expect(inspection.job.contract).not.toHaveProperty("maxToolCalls");
 		expect(inspection.result).not.toHaveProperty("budget");
 		expect(snapshots.at(-1)?.sequence).toBe(2);
+		expect(snapshots.at(-1)?.job).not.toHaveProperty("plannedOutputBytes");
+		expect(snapshots.at(-1)?.job).not.toHaveProperty("reservedOutputBytes");
 		expect(snapshots.at(-1)?.job.contract).not.toHaveProperty("maxTotalTokens");
 		expect(snapshots.at(-1)?.job.contract).not.toHaveProperty("maxTurns");
 		expect(snapshots.at(-1)?.job.contract).not.toHaveProperty("maxToolCalls");
@@ -982,25 +1055,27 @@ describe("durable subagent jobs", () => {
 		await flush();
 	});
 
-	it("rejects an admission that would exceed the owner aggregate output budget", async () => {
+	it("admits queued jobs independently of planned output bytes", async () => {
 		const first = deferredRun();
 		const persisted: PersistedSubagentJobSnapshot[] = [];
 		const registry = createRegistry(
 			(snapshot) => persisted.push(snapshot),
 			() => {},
-			{
-				maxActiveJobs: 1,
-				maxAggregateOutputBytes: 32 * 1024,
-			},
+			{ maxActiveJobs: 1 },
 		);
 		launch(registry, first.run, 24 * 1024);
-		const rejected = vi.fn(async () => completedRun());
+		const second = vi.fn(async () => completedRun());
+		const accepted = launch(registry, second, 512 * 1024);
 
-		expect(() => launch(registry, rejected, 9 * 1024)).toThrowError(/budget/i);
-		expect(persisted).toHaveLength(1);
-		expect(rejected).not.toHaveBeenCalled();
+		expect(accepted.status).toBe("queued");
+		expect(persisted).toHaveLength(2);
+		expect(persisted[1]?.job).not.toHaveProperty("plannedOutputBytes");
+		expect(persisted[1]?.job).not.toHaveProperty("reservedOutputBytes");
+		expect(registry.inspect(accepted.jobId)).not.toHaveProperty("budget");
+		expect(second).not.toHaveBeenCalled();
 		first.settle();
 		await flush();
+		expect(second).toHaveBeenCalledOnce();
 	});
 
 	it("cancels a queued job without invoking it and releases queue capacity", async () => {
@@ -1407,44 +1482,20 @@ describe("durable job identity and artifact parity", () => {
 		expect(registry.inspect(queued.jobId).job).toMatchObject({ jobId: queued.jobId, status: "completed" });
 	});
 
-	it("keeps a needs_time job inspectable and marks it running again after extension", async () => {
-		const registry = createRegistry(
-			() => {},
-			() => {},
-		);
-		const needsTime: SubagentJobRunResult = {
-			result: {
-				...completedRun().result,
-				runId: "run-async",
-				status: "needs_time",
-				partial: true,
-				workArtifact: {
-					schemaVersion: 1,
-					runId: "run-async",
-					profile: "explore",
-					startedAtMs: 1,
-					lastActivities: [],
-					observedOutputBytes: 0,
-					touchedPaths: ["src/app.ts"],
-					candidateEvidencePaths: [],
-					reportProtocol: { status: "missing", diagnostic: "awaiting extension" },
-				},
-			},
-			verification: { verified: false, reason: "pending", paths: [], unresolvedClaims: [] },
+	it("reads legacy needs_time snapshots as interrupted history without resuming them", () => {
+		const legacy = persistedSnapshot("legacy-needs-time", "running") as PersistedSubagentJobSnapshot & {
+			job: PersistedSubagentJobSnapshot["job"] & { status: "needs_time"; runId: string };
 		};
-		const accepted = launch(registry, async () => needsTime);
-		await flush();
-		expect(registry.inspect(accepted.jobId).job).toMatchObject({ status: "needs_time", runId: "run-async" });
+		legacy.job.status = "needs_time";
+		legacy.job.runId = "run-legacy-needs-time";
+		const registry = createRegistry();
+		registry.restore([{ type: "custom", customType: JOB_ENTRY_TYPE, data: legacy }]);
 
-		expect(registry.markManagedRunState("run-async", "running")).toBe(true);
-		expect(registry.inspect(accepted.jobId).job).toMatchObject({ status: "running", runId: "run-async" });
-
-		const completed: SubagentJobRunResult = {
-			result: { ...completedRun().result, runId: "run-async" },
-			verification: { verified: true, reason: "ok", paths: [], unresolvedClaims: [] },
-		};
-		await registry.resolveManagedRun("run-async", completed);
-		expect(registry.inspect(accepted.jobId).job).toMatchObject({ jobId: accepted.jobId, status: "completed" });
+		expect(registry.inspect("legacy-needs-time").job).toMatchObject({
+			jobId: "legacy-needs-time",
+			status: "interrupted",
+			runId: "run-legacy-needs-time",
+		});
 	});
 
 	it("preserves the runtime work artifact when a durable job fails the report protocol", async () => {

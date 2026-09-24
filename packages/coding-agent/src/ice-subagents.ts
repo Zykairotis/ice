@@ -109,6 +109,11 @@ import {
 	normalizeIceToolSchema,
 	resolveIceDelegableTools,
 } from "./ice-subagent-capabilities.ts";
+import {
+	SUBAGENT_CHECKIN_INTERVAL_MS,
+	SubagentCheckInCoordinator,
+	type SubagentCheckInState,
+} from "./ice-subagent-checkin.ts";
 import { createIceCommandHookHandler } from "./ice-subagent-command-hooks.ts";
 import {
 	type ResolvedSubagentConcurrencyPolicy,
@@ -146,6 +151,14 @@ import {
 	SubagentObservatoryStore,
 	type SubagentProgressSnapshot,
 } from "./ice-subagent-observatory.ts";
+import {
+	SUBAGENT_OUTPUT_ARTIFACT_LIMITS,
+	type SubagentOutput,
+	SubagentOutputArtifactError,
+	type SubagentOutputArtifactErrorCode,
+	SubagentOutputArtifactStore,
+	type SubagentOutputRead,
+} from "./ice-subagent-output-artifacts.ts";
 import {
 	evaluateSubagentPreflight,
 	formatSubagentPreflightFailure,
@@ -242,8 +255,6 @@ export type SubagentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high
 export const SUBAGENT_PROFILE_LIMITS = {
 	minTimeoutMs: 1_000,
 	maxTimeoutMs: 10 * 60 * 1_000,
-	minOutputBytes: 1_024,
-	maxOutputBytes: 64 * 1_024,
 	minTemperature: 0,
 	maxTemperature: 2,
 	minTopP: 0,
@@ -252,6 +263,7 @@ export const SUBAGENT_PROFILE_LIMITS = {
 
 /** Conservative per-call ceiling for a management `wait`; expiry is never a child timeout. */
 export const SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS = 60_000;
+const SUBAGENT_MANAGED_REQUEST_LIMIT = 256;
 export const SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS = 30_000;
 /** Bounded number of settled detached-run terminal results retained for post-terminal management. */
 const SUBAGENT_RETAINED_RESULT_LIMIT = 32;
@@ -272,6 +284,7 @@ export interface SubagentManagedObservation {
 	readonly terminal: boolean;
 	readonly waitExpired: boolean;
 	readonly attention?: SubagentRuntimeAttention;
+	readonly checkIn?: SubagentCheckInState;
 	readonly result?: SubagentResult;
 }
 
@@ -386,6 +399,12 @@ export function normalizeUnsafeSubagentStartupArgs(
 export const WRITER_TOOL_NAMES = ["read", "grep", "find", "ls", "write", "edit"] as const;
 export type WriterToolName = (typeof WRITER_TOOL_NAMES)[number];
 
+/**
+ * `timed_out` and `needs_time` remain in the shared status vocabulary only
+ * for historical/persisted compatibility. Current managed launches do not
+ * emit either status after admission; startup deadline expiry is a failed
+ * startup with a timeout diagnostic.
+ */
 export type SubagentStatus =
 	| "created"
 	| "running"
@@ -494,7 +513,6 @@ export interface SubagentProfile {
 	tools: readonly string[];
 	thinkingLevel: SubagentThinkingLevel;
 	timeoutMs: number;
-	maxOutputBytes: number;
 	temperature?: number;
 	topP?: number;
 	/** Appearance-only semantic theme token; it never affects authority. */
@@ -531,8 +549,8 @@ export interface SubagentProfileSummary {
 	/** W08: stable discoverability metadata; bounded tags, never executable resources. */
 	tags?: readonly string[];
 	effectiveThinkingLevel?: SubagentThinkingLevel;
+	effectiveCheckInIntervalMs?: number;
 	effectiveTimeoutMs?: number;
-	effectiveMaxOutputBytes?: number;
 	requestedTemperature?: number;
 	effectiveTemperature?: number;
 	requestedTopP?: number;
@@ -540,8 +558,8 @@ export interface SubagentProfileSummary {
 	color?: SubagentProfileColor;
 	effectiveSettingSources?: Readonly<{
 		thinking: string;
+		checkInIntervalMs: string;
 		timeoutMs: string;
-		maxOutputBytes: string;
 		temperature: string;
 		topP: string;
 	}>;
@@ -596,6 +614,8 @@ export const SUBAGENT_BATCH_LIMITS = {
 	defaultConcurrency: SUBAGENT_CONCURRENCY_LIMITS.bundledDefault,
 	maxConcurrency: SUBAGENT_CONCURRENCY_LIMITS.hardCap,
 	defaultBudgetBytes: 256 * 1024,
+	maxManagedBatches: 16,
+	retainedManagedBatches: 32,
 } as const;
 
 export const SUBAGENT_PROFILE_ALIASES: Readonly<Record<string, string>> = Object.freeze({});
@@ -670,6 +690,11 @@ export const SUBAGENT_HANDOFF_CONTEXT_LIMITS = {
 export const SUBAGENT_REPORT_LIMITS = {
 	maxEvidencePaths: 64,
 	maxEvidencePathBytes: 4096,
+} as const;
+
+/** Fixed parser/input safety bound, independent of child execution and parent display size. */
+export const SUBAGENT_REPORT_PARSER_LIMITS = {
+	maxBytes: 24 * 1024,
 } as const;
 
 /**
@@ -843,7 +868,6 @@ export interface SubagentExecutionOverrideInput {
 	hooks?: string[];
 	thinking?: SubagentThinkingLevel;
 	tools?: string[];
-	maxOutputBytes?: number;
 	temperature?: number;
 	topP?: number;
 }
@@ -851,19 +875,19 @@ export interface SubagentExecutionOverrideInput {
 export interface SubagentExecutionContract {
 	thinking: SubagentThinkingLevel;
 	tools: readonly string[] | undefined;
-	maxOutputBytes: number;
 	temperature?: number;
 	topP?: number;
 }
 
 export const SUBAGENT_EXECUTION_LIMITS = {
-	minOutputBytes: 1_024,
-	maxOutputBytes: 64 * 1_024,
 	minTemperature: 0,
 	maxTemperature: 2,
 	minTopP: 0,
 	maxTopP: 1,
 } as const;
+
+/** Fixed bound for each delegated external-tool response, independent of final-answer retention. */
+const SUBAGENT_DELEGABLE_TOOL_OUTPUT_MAX_BYTES = 24 * 1024;
 
 export interface SubagentRequest {
 	parentSessionId: string;
@@ -874,6 +898,7 @@ export interface SubagentRequest {
 	context?: string;
 	contextPacket?: SubagentContextPacketInput;
 	contextMode?: SubagentContextMode;
+	checkInIntervalMs?: number;
 	timeoutMs?: number;
 	execution?: SubagentExecutionOverrideInput;
 	resources?: SubagentResourceSelection;
@@ -903,14 +928,12 @@ export interface WriterRequest {
 	baseCommit: string;
 	cwd?: string;
 	timeoutMs?: number;
-	maxOutputBytes?: number;
 }
 
-export interface NormalizedWriterRequest extends Omit<WriterRequest, "scope" | "cwd" | "timeoutMs" | "maxOutputBytes"> {
+export interface NormalizedWriterRequest extends Omit<WriterRequest, "scope" | "cwd" | "timeoutMs"> {
 	scope: { roots: string[] };
 	cwd: string;
 	timeoutMs: number;
-	maxOutputBytes: number;
 	allowExternal: boolean;
 }
 
@@ -966,6 +989,7 @@ export interface WriterResult {
 	summary: string;
 	baseCommit: string;
 	observedOutputBytes: number;
+	output?: SubagentOutput;
 	workspaceRemoved: boolean;
 	diagnostics: SubagentDiagnostic[];
 	patchArtifact?: WriterPatchArtifact;
@@ -984,6 +1008,7 @@ export interface NormalizedSubagentRequest
 		| "context"
 		| "contextPacket"
 		| "contextMode"
+		| "checkInIntervalMs"
 		| "acceptanceCriteria"
 		| "preflight"
 		| "outputSchema"
@@ -992,6 +1017,7 @@ export interface NormalizedSubagentRequest
 	role: string;
 	agentKind: "file" | "self";
 	contextMode: SubagentContextMode;
+	checkInIntervalMs: number;
 	hookIds?: readonly string[];
 	requestedModel?: string;
 	fallbackModel?: string;
@@ -1025,7 +1051,6 @@ export interface NormalizedSubagentRequest
 	deniedTools: readonly string[];
 	/** Resolved settings and provenance frozen before launch admission. */
 	iceContract: IceResolvedSubagentContract;
-	maxOutputBytes: number;
 	contextPacket: SubagentContextPacket;
 	forkContext: SubagentForkContext;
 	resources: ResolvedSubagentResources;
@@ -1046,6 +1071,7 @@ export interface SubagentBatchTask {
 	context?: string;
 	contextPacket?: SubagentContextPacketInput;
 	contextMode?: SubagentContextMode;
+	checkInIntervalMs?: number;
 	timeoutMs?: number;
 	execution?: SubagentExecutionOverrideInput;
 	resources?: SubagentResourceSelection;
@@ -1076,7 +1102,14 @@ export interface SubagentUsage {
 }
 
 export interface SubagentDiagnostic {
-	code: SubagentFailureCode | "output_truncated" | "report_spilled" | "report_artifact_failure";
+	code:
+		| SubagentFailureCode
+		| "output_truncated"
+		| "output_artifact_truncated"
+		| "output_artifact_unavailable"
+		| "output_artifact_integrity_failure"
+		| "report_spilled"
+		| "report_artifact_failure";
 	message: string;
 	retryable?: boolean;
 }
@@ -1104,6 +1137,7 @@ export interface ReviewTask {
 	context?: string;
 	contextPacket?: SubagentContextPacketInput;
 	contextMode?: SubagentContextMode;
+	checkInIntervalMs?: number;
 	timeoutMs?: number;
 	execution?: SubagentExecutionOverrideInput;
 	resources?: SubagentResourceSelection;
@@ -1131,7 +1165,7 @@ export type SubagentAttemptNumber = 1 | 2;
 export interface SubagentAttemptSummary {
 	attempt: SubagentAttemptNumber;
 	status: SubagentStatus;
-	failureCode?: SubagentFailureCode;
+	failureCode?: SubagentDiagnostic["code"];
 	observedOutputBytes: number;
 }
 
@@ -1170,7 +1204,9 @@ export interface SubagentResult {
 	scopeTargets?: string[];
 	/** Runtime-owned bounded projection of observed work; survives report-protocol failures. */
 	workArtifact?: SubagentWorkArtifact;
-	/** Bounded local capture for oversized final or partial assistant output. */
+	/** Bounded final-answer projection and optional owner-scoped artifact reference. */
+	output?: SubagentOutput;
+	/** Transitional v1 persistence field; new results must not populate or expose it. */
 	reportArtifact?: SubagentReportArtifact;
 	/** Child claims for parent acceptance criteria; untrusted until parent-verified. */
 	requirementClaims?: readonly SubagentRequirementClaim[];
@@ -1229,17 +1265,16 @@ export interface SubagentLaunchProvenance {
 	adapterIds?: readonly string[];
 	scopeRoots: string[];
 	scopeTargets: string[];
+	checkIn: { intervalMs: number; source: string };
 	execution: {
 		thinking: SubagentThinkingLevel;
 		timeoutMs: number;
-		maxOutputBytes: number;
 		temperature?: number;
 		topP?: number;
 		tools?: readonly string[];
 		sources: {
 			thinking: string;
 			timeoutMs: string;
-			maxOutputBytes: string;
 			temperature: string;
 			topP: string;
 		};
@@ -1274,7 +1309,6 @@ export interface SubagentLaunchPreflightTask {
 	execution: {
 		thinking: SubagentThinkingLevel;
 		timeoutMs: number;
-		maxOutputBytes: number;
 		temperature?: number;
 		topP?: number;
 		tools: readonly string[] | undefined;
@@ -1311,11 +1345,6 @@ export interface SubagentLaunchPreflight {
 	batchId?: string;
 	taskCount: number;
 	concurrency: number;
-	budget: {
-		totalOutputBytes: number;
-		reservedOutputBytes: number;
-		maxPotentialOutputBytes: number;
-	};
 	recovery: {
 		maxAttempts: 1 | 2;
 		sameModel: boolean;
@@ -1324,18 +1353,9 @@ export interface SubagentLaunchPreflight {
 	tasks: SubagentLaunchPreflightTask[];
 }
 
-export type SubagentBatchStatus = "completed" | "partial" | "needs_time" | "failed" | "cancelled" | "timed_out";
-
-export interface SubagentBatchBudget {
-	total: number;
-	reserved: number;
-	consumed: number;
-	remaining: number;
-	released: number;
-}
+export type SubagentBatchStatus = "completed" | "partial" | "failed" | "cancelled" | "timed_out";
 
 export type AggregateUsage = SubagentUsage;
-export type BatchBudget = SubagentBatchBudget;
 
 export interface SubagentBatchItemResult {
 	taskId: string;
@@ -1353,7 +1373,6 @@ export interface SubagentBatchResult {
 	preflight: SubagentLaunchPreflight;
 	items: SubagentBatchItemResult[];
 	usage: AggregateUsage;
-	budget: SubagentBatchBudget;
 	diagnostics: SubagentDiagnostic[];
 }
 
@@ -1373,11 +1392,64 @@ export interface ReviewBatchResult {
 	preflight: SubagentLaunchPreflight;
 	reviewers: ReviewerResult[];
 	usage: AggregateUsage;
-	budget: SubagentBatchBudget;
 	diagnostics: SubagentDiagnostic[];
 }
 
+type ManagedBatchTaskStatus = "queued" | "admitted" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+
+interface ManagedBatchTaskState {
+	taskId: string;
+	runId: string;
+	role: string;
+	model: string;
+	status: ManagedBatchTaskStatus;
+	checkIn?: SubagentCheckInState;
+	currentTool?: string;
+	currentPath?: string;
+}
+
+interface ManagedSubagentBatchRecord {
+	readonly batchId: string;
+	readonly ownerSessionId: string;
+	readonly kind: "batch" | "review";
+	readonly acceptedAt: number;
+	readonly tasks: Map<string, ManagedBatchTaskState>;
+	readonly controller: AbortController;
+	readonly outputArtifactIds: Set<string>;
+	state: "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
+	completion?: Promise<SubagentBatchResult | ReviewBatchResult>;
+	result?: SubagentBatchResult | ReviewBatchResult;
+}
+
+type ManagedWriterInspection = {
+	runId: string;
+	state: "starting" | "running" | WriterResultStatus;
+	waitExpired?: boolean;
+	acceptedAt: number;
+	baseCommit: string;
+	workspaceIsolation: "worktree" | "parent";
+	phase: ObservatoryPhase;
+	currentTool?: string;
+	currentPath?: string;
+	lastProgressAt?: number;
+	checkIn?: SubagentCheckInState;
+	result?: WriterResult;
+};
+
+interface ManagedWriterRecord extends ManagedWriterInspection {
+	ownerSessionId: string;
+	controller: AbortController;
+	completion?: Promise<WriterResult>;
+}
+
 export interface SubagentBatchRunOptions {
+	batchId?: string;
+	/** Return admitted child handles without waiting for the aggregate result. */
+	managedBackground?: boolean;
+	/** Owner integration arms periodic check-ins after each child session is admitted. */
+	onManagedHandle?: (task: ResolvedSubagentBatchTask, handle: SubagentManagedHandle) => void;
+	/** Called exactly once after each child's terminal result or launch failure. */
+	onChildTerminal?: (task: ResolvedSubagentBatchTask, result?: SubagentResult) => void;
 	concurrency?: number;
 	/** Canonical resolved concurrency policy; defaults to bundled batch limits. */
 	concurrencyPolicy?: ResolvedSubagentConcurrencyPolicy;
@@ -1387,8 +1459,6 @@ export interface SubagentBatchRunOptions {
 	/** Parent-resolved retry policy copied into each isolated child session. */
 	settingsManager?: SettingsManager;
 	unsafeHostExec?: boolean;
-	totalBudgetBytes?: number;
-	timeoutMs?: number;
 	failFast?: boolean;
 	signal?: AbortSignal;
 	onEvent?: (event: SubagentEvent) => void;
@@ -1439,8 +1509,7 @@ export interface SubagentEvent {
 		| "subagent_completed"
 		| "subagent_failed"
 		| "subagent_cancelled"
-		| "subagent_timed_out"
-		| "subagent_needs_time";
+		| "subagent_timed_out";
 	runId: string;
 	parentSessionId: string;
 	childSessionId?: string;
@@ -1721,7 +1790,7 @@ function formatDurableJobIdentifierError(error: unknown, jobId: string): string 
 	return `${message} This tool requires the bare durable jobId returned as details.accepted.jobId by delegate_async; do not pass a resultRef (job:<id>), foreground runId, batchId, or taskId.${resultRefHint}`;
 }
 
-type StartupControlReason = "cancelled" | "timed_out";
+type StartupControlReason = "cancelled" | "deadline_exceeded";
 type StartupOutcome<T> =
 	| { kind: "completed"; value: T }
 	| { kind: "error"; error: unknown }
@@ -1750,7 +1819,7 @@ async function awaitSubagentStartup<T>(
 			removeAbortListener = () => signal.removeEventListener("abort", abortListener);
 		}
 	}
-	timer = setTimeout(() => resolveControl?.("timed_out"), timeoutMs);
+	timer = setTimeout(() => resolveControl?.("deadline_exceeded"), timeoutMs);
 	try {
 		return await Promise.race([startupOutcome, control.then((kind) => ({ kind }))]);
 	} finally {
@@ -2168,6 +2237,13 @@ function loadProfilesFromDirectory(
 			const parsed = parseFrontmatter<Record<string, unknown>>(bytes.toString("utf8"));
 			const frontmatter = parsed.frontmatter;
 			const body = parsed.body;
+			const removedOutputFields = ["max-output-bytes", "maxOutputBytes", "max_output_bytes"];
+			if (removedOutputFields.some((field) => Object.hasOwn(frontmatter, field))) {
+				throw new SubagentError(
+					"malformed_result",
+					`Final-answer output cap metadata was removed from profiles in ${sourcePath}; output retention uses fixed host limits.`,
+				);
+			}
 			const supportedFields = new Set([
 				"name",
 				"description",
@@ -2182,11 +2258,8 @@ function loadProfilesFromDirectory(
 				"mcp_tools",
 				"thinking",
 				"thinkingLevel",
-				"timeout",
-				"timeoutMs",
-				"max-output-bytes",
-				"maxOutputBytes",
-				"max_output_bytes",
+				"startup-timeout-ms",
+				"startupTimeoutMs",
 				"temperature",
 				"top-p",
 				"topP",
@@ -2273,20 +2346,11 @@ function loadProfilesFromDirectory(
 					diagnostics,
 				),
 				timeoutMs: parseBoundedProfileNumber(
-					frontmatter.timeout ?? frontmatter.timeoutMs,
-					"timeout",
+					frontmatter["startup-timeout-ms"] ?? frontmatter.startupTimeoutMs,
+					"startup timeout",
 					60_000,
 					SUBAGENT_PROFILE_LIMITS.minTimeoutMs,
 					SUBAGENT_PROFILE_LIMITS.maxTimeoutMs,
-					diagnostics,
-					true,
-				),
-				maxOutputBytes: parseBoundedProfileNumber(
-					frontmatter["max-output-bytes"] ?? frontmatter.maxOutputBytes ?? frontmatter.max_output_bytes,
-					"max-output-bytes",
-					24 * 1024,
-					SUBAGENT_PROFILE_LIMITS.minOutputBytes,
-					SUBAGENT_PROFILE_LIMITS.maxOutputBytes,
 					diagnostics,
 					true,
 				),
@@ -3861,7 +3925,6 @@ export function resolveSelfSubagentProfile(
 		tools: requestedTools,
 		thinkingLevel: "medium" as const,
 		timeoutMs: 120_000,
-		maxOutputBytes: 24 * 1024,
 		selfDelegated: true as const,
 		modelPolicy: "inherit-parent" as const,
 		source: "self" as const,
@@ -3945,16 +4008,16 @@ function profileSummary(
 		...(profile.tags ? { tags: profile.tags } : {}),
 		...(profile.color ? { color: profile.color } : {}),
 		effectiveThinkingLevel: profile.thinkingLevel,
+		effectiveCheckInIntervalMs: SUBAGENT_CHECKIN_INTERVAL_MS,
 		effectiveTimeoutMs: profile.timeoutMs,
-		effectiveMaxOutputBytes: profile.maxOutputBytes,
 		...(profile.temperature !== undefined
 			? { requestedTemperature: profile.temperature, effectiveTemperature: profile.temperature }
 			: {}),
 		...(profile.topP !== undefined ? { requestedTopP: profile.topP, effectiveTopP: profile.topP } : {}),
 		effectiveSettingSources: Object.freeze({
 			thinking: "bundled",
+			checkInIntervalMs: "bundled",
 			timeoutMs: "bundled",
-			maxOutputBytes: "bundled",
 			temperature: "bundled",
 			topP: "bundled",
 		}),
@@ -4689,14 +4752,13 @@ export function normalizeSubagentAcceptanceCriteria(
  * run is consumed, and an empty tools array means no tools (never fallback).
  */
 export function normalizeSubagentExecutionOverride(
-	profile: Pick<ResolvedSubagentProfile, "thinkingLevel" | "maxOutputBytes" | "temperature" | "topP">,
+	profile: Pick<ResolvedSubagentProfile, "thinkingLevel" | "temperature" | "topP">,
 	execution: SubagentExecutionOverrideInput | undefined,
 ): SubagentExecutionContract {
 	if (execution === undefined) {
 		return Object.freeze({
 			thinking: profile.thinkingLevel,
 			tools: undefined,
-			maxOutputBytes: profile.maxOutputBytes,
 			...(profile.temperature !== undefined ? { temperature: profile.temperature } : {}),
 			...(profile.topP !== undefined ? { topP: profile.topP } : {}),
 		});
@@ -4704,15 +4766,27 @@ export function normalizeSubagentExecutionOverride(
 	if (typeof execution !== "object" || execution === null || Array.isArray(execution)) {
 		throw new SubagentError("malformed_result", "Subagent execution overrides must be an object.");
 	}
+	if (Object.hasOwn(execution, "maxOutputBytes")) {
+		throw new SubagentError(
+			"malformed_result",
+			'"execution.maxOutputBytes" was removed; final-answer retention uses fixed host limits.',
+		);
+	}
 	if (Object.hasOwn(execution, "maxTotalTokens")) {
-		throw new SubagentError("malformed_result", '"maxTotalTokens" was removed; use timeoutMs/maxOutputBytes');
+		throw new SubagentError(
+			"malformed_result",
+			'"maxTotalTokens" was removed; use startupTimeoutMs and provider/model token limits.',
+		);
 	}
 	for (const key of ["maxTurns", "maxToolCalls"] as const) {
 		if (Object.hasOwn(execution, key)) {
-			throw new SubagentError("malformed_result", `"${key}" was removed; use timeoutMs/maxOutputBytes`);
+			throw new SubagentError(
+				"malformed_result",
+				`"${key}" was removed; use startupTimeoutMs and provider/model token limits.`,
+			);
 		}
 	}
-	const allowed = new Set(["thinking", "tools", "maxOutputBytes", "temperature", "topP", "hooks", "model"]);
+	const allowed = new Set(["thinking", "tools", "temperature", "topP", "hooks", "model"]);
 	if (
 		execution.model !== undefined &&
 		(typeof execution.model !== "string" ||
@@ -4755,23 +4829,6 @@ export function normalizeSubagentExecutionOverride(
 		}
 		tools = Object.freeze(normalized);
 	}
-	const checkBudget = (value: number | undefined, label: string, minimum: number, maximum: number): number => {
-		if (value === undefined) return maximum;
-		if (!Number.isInteger(value) || value < minimum || value > maximum) {
-			throw new SubagentError("malformed_result", `Subagent execution ${label} is outside the bounded range.`);
-		}
-		return value;
-	};
-	const maxOutputBytes =
-		execution.maxOutputBytes === undefined
-			? Math.min(profile.maxOutputBytes, SUBAGENT_EXECUTION_LIMITS.maxOutputBytes)
-			: checkBudget(
-					execution.maxOutputBytes,
-					"maxOutputBytes",
-					SUBAGENT_EXECUTION_LIMITS.minOutputBytes,
-					SUBAGENT_EXECUTION_LIMITS.maxOutputBytes,
-				);
-
 	const checkSampling = (
 		value: number | undefined,
 		label: string,
@@ -4799,7 +4856,6 @@ export function normalizeSubagentExecutionOverride(
 	return Object.freeze({
 		thinking: execution.thinking ?? profile.thinkingLevel,
 		tools,
-		maxOutputBytes,
 		...(temperature !== undefined ? { temperature } : {}),
 		...(topP !== undefined ? { topP } : {}),
 	});
@@ -4831,10 +4887,18 @@ function resolveIceContractForRequest(
 	}
 	const globalSettings = parseIceSettings(manager.getGlobalSettings().ice).subagents;
 	const projectSettings = parseIceSettings(manager.getProjectSettings().ice).subagents;
+	if (
+		request.checkInIntervalMs !== undefined &&
+		(!Number.isSafeInteger(request.checkInIntervalMs) || request.checkInIntervalMs < SUBAGENT_CHECKIN_INTERVAL_MS)
+	)
+		throw new SubagentError(
+			"malformed_result",
+			`checkInIntervalMs must be an integer of at least ${SUBAGENT_CHECKIN_INTERVAL_MS} ms.`,
+		);
 	const call: IceContractCallInput = {};
-	if (request.timeoutMs !== undefined) call.timeoutMs = request.timeoutMs;
+	if (request.checkInIntervalMs !== undefined) call.checkInIntervalMs = request.checkInIntervalMs;
+	if (request.timeoutMs !== undefined) call.startupTimeoutMs = request.timeoutMs;
 	if (request.execution?.thinking !== undefined) call.thinking = validatedExecution.thinking;
-	if (request.execution?.maxOutputBytes !== undefined) call.maxOutputBytes = validatedExecution.maxOutputBytes;
 	if (request.execution?.temperature !== undefined) call.temperature = validatedExecution.temperature;
 	if (request.execution?.topP !== undefined) call.topP = validatedExecution.topP;
 	const contract = resolveIceSubagentContract({
@@ -4846,8 +4910,8 @@ function resolveIceContractForRequest(
 		call,
 		bundledDefaults: {
 			thinking: profile.thinkingLevel,
-			timeoutMs: profile.timeoutMs,
-			maxOutputBytes: profile.maxOutputBytes,
+			checkInIntervalMs: SUBAGENT_CHECKIN_INTERVAL_MS,
+			startupTimeoutMs: profile.timeoutMs,
 			temperature: profile.temperature,
 			topP: profile.topP,
 		},
@@ -5109,7 +5173,6 @@ export function normalizeSubagentRequest(
 	const resolvedExecution: SubagentExecutionContract = Object.freeze({
 		thinking: iceContract.values.thinking,
 		tools: requestedTools,
-		maxOutputBytes: iceContract.values.maxOutputBytes,
 		...(iceContract.values.temperature !== undefined ? { temperature: iceContract.values.temperature } : {}),
 		...(iceContract.values.topP !== undefined ? { topP: iceContract.values.topP } : {}),
 	});
@@ -5136,13 +5199,13 @@ export function normalizeSubagentRequest(
 		forkContext,
 		// Public tool schemas reject values below minTimeoutMs; retain the low-level
 		// runner's existing positive-value behavior for deterministic short-timeout tests.
+		checkInIntervalMs: iceContract.values.checkInIntervalMs,
 		timeoutMs: Math.min(Math.max(iceContract.values.timeoutMs, 1), SUBAGENT_PROFILE_LIMITS.maxTimeoutMs),
 		execution: resolvedExecution,
 		executionThinkingExplicit,
 		requestedTools: requestedTools === undefined ? undefined : Object.freeze(requestedTools),
 		deniedTools: iceContract.deniedTools,
 		iceContract,
-		maxOutputBytes: resolvedExecution.maxOutputBytes,
 		resources,
 		projectTrusted,
 		allowExternal: options.allowExternal === true,
@@ -5158,8 +5221,7 @@ export function normalizeSubagentRequest(
 
 const WRITER_DEFAULT_TIMEOUT_MS = 60_000;
 const WRITER_MAX_TIMEOUT_MS = 10 * 60 * 1000;
-const WRITER_DEFAULT_OUTPUT_BYTES = 24 * 1024;
-const WRITER_MAX_OUTPUT_BYTES = 64 * 1024;
+const MANAGED_WRITER_LIMITS = { maxActive: 4, retained: 16 } as const;
 
 export function normalizeWriterRequest(
 	request: WriterRequest,
@@ -5185,13 +5247,11 @@ export function normalizeWriterRequest(
 	) {
 		throw new SubagentError("malformed_result", "Writer timeout must be a positive finite number.");
 	}
-	if (
-		request.maxOutputBytes !== undefined &&
-		(typeof request.maxOutputBytes !== "number" ||
-			!Number.isInteger(request.maxOutputBytes) ||
-			request.maxOutputBytes <= 0)
-	) {
-		throw new SubagentError("malformed_result", "Writer output budget must be a positive integer.");
+	if (Object.hasOwn(request, "maxOutputBytes")) {
+		throw new SubagentError(
+			"malformed_result",
+			'"maxOutputBytes" was removed; writer final-answer retention uses fixed host limits.',
+		);
 	}
 	const resolvedCwd = canonicalPath(resolve(cwd));
 	if (!request.scope || !Array.isArray(request.scope.roots) || request.scope.roots.length === 0) {
@@ -5237,7 +5297,6 @@ export function normalizeWriterRequest(
 		baseCommit: request.baseCommit,
 		cwd: resolvedCwd,
 		timeoutMs: Math.min(request.timeoutMs ?? WRITER_DEFAULT_TIMEOUT_MS, WRITER_MAX_TIMEOUT_MS),
-		maxOutputBytes: Math.min(request.maxOutputBytes ?? WRITER_DEFAULT_OUTPUT_BYTES, WRITER_MAX_OUTPUT_BYTES),
 		allowExternal: options.allowExternal === true,
 	};
 }
@@ -5285,6 +5344,7 @@ export function deriveSubagentPromptCacheKey(
 	model: Model<Api> | undefined,
 	childTools: readonly string[],
 	unsafeHostExec = false,
+	noLifetimeTimeout = false,
 ): string | undefined {
 	if (request.contextMode !== "fork") return undefined;
 	const material = {
@@ -5322,6 +5382,7 @@ export function deriveSubagentPromptCacheKey(
 			tools: request.execution.tools ? sortSubagentCacheCollection(request.execution.tools) : undefined,
 		},
 		timeoutMs: request.timeoutMs,
+		noLifetimeTimeout,
 		// Only collections canonicalized in the provider-visible request are sorted above.
 		// Resource/tool ordering below remains provider-visible and therefore part of cache identity.
 		childTools: [...childTools],
@@ -5375,6 +5436,7 @@ export function buildSubagentPrompt(
 	request: NormalizedSubagentRequest,
 	selectedPromptContents: readonly SelectedPromptContent[] = request.resources.prompts.map(loadSelectedPromptContent),
 	unsafeHostExec = false,
+	noLifetimeTimeout = false,
 ): string {
 	const scope = sortSubagentCacheCollection(request.scope.roots)
 		.map((root) => `- ${root}`)
@@ -5436,21 +5498,21 @@ export function buildSubagentPrompt(
 	// W12: the execution contract is advisory prompt context; runtime output
 	// and tool eligibility are enforced by NativeSubagentRunner, never by prose.
 	const executionTools = request.execution.tools ? sortSubagentCacheCollection(request.execution.tools) : undefined;
+	const runtimeLimit = noLifetimeTimeout
+		? "Execution contract: this child has no lifetime timeout. The parent may send periodic advisory check-ins; continue until the task is complete or the parent explicitly stops the run."
+		: `Execution contract: wall-clock timeout ${request.timeoutMs} ms.`;
 	const executionContractNote =
 		executionTools !== undefined
-			? `Execution contract: wall-clock timeout ${request.timeoutMs} ms and complete parent-facing output cap ${request.execution.maxOutputBytes} bytes; approved tools [${executionTools.join(", ") || "none"}]. Use them as needed and stop when the task is complete.`
-			: `Execution contract: wall-clock timeout ${request.timeoutMs} ms and complete parent-facing output cap ${request.execution.maxOutputBytes} bytes. Stop when the task is complete.`;
+			? `${runtimeLimit} Approved tools [${executionTools.join(", ") || "none"}]. Use them as needed and return a complete final answer when the task is complete.`
+			: `${runtimeLimit} Return a complete final answer when the task is complete.`;
 	const structuredReportInstructions =
 		request.reportMode === "structured_report"
-			? [
-					`Keep the complete JSON report within ${request.maxOutputBytes} UTF-8 bytes.`,
-					reportContract + (request.outputSchema ? ' Include the required "payload" object.' : ""),
-				]
+			? [reportContract + (request.outputSchema ? ' Include the required "payload" object.' : "")]
 			: [];
 	const plainFinalInstructions =
 		request.reportMode === "plain_final_turn"
 			? [
-					`When the work is done, end with one plain final answer message in ordinary prose or markdown; do not wrap it in a JSON envelope. Keep the complete final answer within ${request.maxOutputBytes} UTF-8 bytes. The runtime ingests that final assistant message directly as the delegated result.`,
+					"When the work is done, end with one plain final answer message in ordinary prose or markdown; do not wrap it in a JSON envelope. The runtime ingests that final assistant message directly as the delegated result.",
 				]
 			: [];
 	return [
@@ -5604,16 +5666,6 @@ const INTERACTIVE_PLAIN_FINAL_PROMPT =
 	`${INTERACTIVE_FINAL_REPORT_MARKER} Return your final answer for the parent now, in ordinary prose or markdown; do not wrap it in a JSON envelope. ` +
 	"Do not continue discussion or start new work. Keep the answer bounded and include only verified results within the approved scope. " +
 	"This is an internal finalization request, not a new task or permission grant.";
-const SUBAGENT_EXTENSION_MARKER = "[ICE VOID SUBAGENT CONTINUE]";
-const SUBAGENT_EXTENSION_PROMPT =
-	`${SUBAGENT_EXTENSION_MARKER} Your execution window was extended. Continue the already-authorized task from the current child session state. ` +
-	"Do not repeat completed exploration unnecessarily. Scope, authority, model, output budget, and evidence requirements remain unchanged. " +
-	"Return the required final bounded JSON report when the task is complete. This is an internal continuation request, not a new task or permission grant.";
-const SUBAGENT_EXTENSION_PROMPT_PLAIN =
-	`${SUBAGENT_EXTENSION_MARKER} Your execution window was extended. Continue the already-authorized task from the current child session state. ` +
-	"Do not repeat completed exploration unnecessarily. Scope, authority, model, and output budget remain unchanged. " +
-	"When the task is complete, end with one plain final answer message in ordinary prose or markdown; do not wrap it in a JSON envelope. " +
-	"This is an internal continuation request, not a new task or permission grant.";
 const SUBAGENT_WRAP_UP_MARKER = "[ICE VOID SUBAGENT WRAP UP]";
 const SUBAGENT_WRAP_UP_PROMPT =
 	`${SUBAGENT_WRAP_UP_MARKER} Remaining execution capacity is reserved for completion. Stop broad exploration and do not start new tool work. ` +
@@ -6089,25 +6141,54 @@ export function verifySubagentResult(result: SubagentResult, request: Normalized
 	if (result.partial) {
 		return reject("Completed result cannot be partial.");
 	}
-	if (!Number.isInteger(result.observedOutputBytes) || result.observedOutputBytes < 0) {
-		return reject("Result report size is missing or invalid.");
+	if (!Number.isSafeInteger(result.observedOutputBytes) || result.observedOutputBytes < 0) {
+		return reject("Observed final-answer size is missing or invalid.");
 	}
-	if (result.observedOutputBytes > request.maxOutputBytes) {
-		return reject("Result report exceeds the approved output cap.");
+	const output = result.output;
+	if (
+		!output ||
+		typeof output.text !== "string" ||
+		!Number.isSafeInteger(output.originalBytes) ||
+		output.originalBytes < 0 ||
+		output.textBytes !== Buffer.byteLength(output.text, "utf8") ||
+		output.textBytes > SUBAGENT_OUTPUT_ARTIFACT_LIMITS.inlineBytes
+	) {
+		return reject("Completed result is missing a valid bounded output projection.");
+	}
+	if (output.captureStatus === "artifact_unavailable" || output.captureStatus === "artifact_truncated") {
+		return reject("The complete final answer was not retained; output cannot be verified.");
+	}
+	if (output.captureStatus === "inline_complete") {
+		if (output.inlineTruncated || output.artifact)
+			return reject("Inline output materialization metadata is inconsistent.");
+	} else if (
+		output.captureStatus === "artifact_complete" &&
+		(!output.inlineTruncated ||
+			!output.artifact ||
+			output.artifact.schemaVersion !== 2 ||
+			output.artifact.truncated ||
+			!/^([a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/.test(output.artifact.id) ||
+			!Number.isSafeInteger(output.artifact.storedBytes) ||
+			output.artifact.storedBytes < 1 ||
+			!Number.isSafeInteger(output.artifact.originalBytes) ||
+			!/^[a-f0-9]{64}$/.test(output.artifact.sha256) ||
+			(output.artifact.contentType !== "text/plain" && output.artifact.contentType !== "application/json"))
+	) {
+		return reject("Output artifact metadata is invalid or incomplete.");
 	}
 	if (typeof result.summary !== "string" || result.summary.trim().length === 0) {
 		return reject("Result summary is empty or invalid.");
 	}
-	if (Buffer.byteLength(result.summary) > request.maxOutputBytes) {
-		return reject("Result summary exceeds the approved output cap.");
+	if (Buffer.byteLength(result.summary) > SUBAGENT_OUTPUT_ARTIFACT_LIMITS.inlineBytes) {
+		return reject("Result summary exceeds the fixed parent-facing projection limit.");
 	}
-	// Plain final-turn ingestion verifies lineage, status, and the output bound only.
+	// Plain final-turn ingestion verifies lineage, complete output materialization, and status only.
 	// It must never claim structured-report, evidence, or payload verification.
 	if (request.reportMode === "plain_final_turn") {
 		return {
 			verified: true,
 			reason:
-				"Plain final-turn answer passed lineage and output-bound verification; no structured report, evidence paths, or payload claims were verified.",
+				"Plain final-turn answer passed lineage and complete-output materialization checks; no structured report, evidence paths, or payload claims were verified.",
 			paths: [],
 			unresolvedClaims: [],
 			kind: "plain_bounds",
@@ -6340,6 +6421,7 @@ export interface SubagentHookRuntime {
 export interface NativeSubagentSessionOptions {
 	request: NormalizedSubagentRequest;
 	parentActiveTools: readonly string[];
+	noLifetimeTimeout?: boolean;
 	unsafeHostExec?: boolean;
 	model?: Model<Api>;
 	modelRuntime?: ModelRuntime;
@@ -6485,6 +6567,7 @@ export interface SubagentLiveSession {
 	readonly authority?: "safe" | "yolo";
 	readonly color?: IceAgentViewColor;
 	readonly presentation?: IceAgentViewPresentation;
+	readonly checkIn?: SubagentCheckInState;
 	readonly session: CreateAgentSessionResult["session"];
 	readonly control?: IceAgentViewLiveSessionControl;
 }
@@ -6497,6 +6580,7 @@ export interface SubagentLiveSessionRegistration {
 	readonly authority?: "safe" | "yolo";
 	readonly color?: IceAgentViewColor;
 	readonly presentation?: IceAgentViewPresentation;
+	readonly checkIn?: SubagentCheckInState;
 	readonly session: CreateAgentSessionResult["session"];
 	readonly control?: IceAgentViewLiveSessionControl;
 }
@@ -6533,6 +6617,15 @@ export class SubagentLiveSessionRegistry {
 				...(presentation ? { presentation } : {}),
 			}),
 		);
+		this.publish();
+		return true;
+	}
+
+	updateCheckInState(runId: string, checkIn: SubagentCheckInState | undefined): boolean {
+		const current = this.sessions.get(runId);
+		if (!current) return false;
+		const { checkIn: _previous, ...withoutCheckIn } = current;
+		this.sessions.set(runId, Object.freeze(checkIn ? { ...withoutCheckIn, checkIn } : withoutCheckIn));
 		this.publish();
 		return true;
 	}
@@ -6574,7 +6667,6 @@ export function createSubagentLiveSessionControl(
 	let steered = false;
 	let controlled = false;
 	let pendingSteering = 0;
-	let stateBeforeExtension: IceAgentViewControlState = "working";
 	const controlReleaseWaiters = new Set<() => void>();
 	const steeringWaiters = new Set<() => void>();
 	const changed = (): void => onChange();
@@ -6636,19 +6728,7 @@ export function createSubagentLiveSessionControl(
 			changed();
 			return true;
 		},
-		markAwaitingExtension: () => {
-			if (state === "terminal" || state === "awaiting-extension") return false;
-			stateBeforeExtension = state;
-			state = "awaiting-extension";
-			changed();
-			return true;
-		},
-		resumeFromExtension: () => {
-			if (state !== "awaiting-extension") return false;
-			state = stateBeforeExtension === "final-report-requested" ? "final-report-requested" : "working";
-			changed();
-			return true;
-		},
+
 		markTerminal: () => {
 			if (state === "terminal") return;
 			state = "terminal";
@@ -6879,7 +6959,12 @@ export async function createNativeSubagentSession(
 		content: redactCredentialText(readValidatedResource(resource).toString("utf8")),
 	}));
 	const selectedPromptContents = options.request.resources.prompts.map(loadSelectedPromptContent);
-	const prompt = buildSubagentPrompt(options.request, selectedPromptContents, options.unsafeHostExec === true);
+	const prompt = buildSubagentPrompt(
+		options.request,
+		selectedPromptContents,
+		options.unsafeHostExec === true,
+		options.noLifetimeTimeout === true,
+	);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: options.request.cwd,
 		agentDir,
@@ -6979,7 +7064,7 @@ export async function createNativeSubagentSession(
 			cwd: options.request.cwd,
 			scopeRoots: options.request.scope.roots,
 		},
-		Math.min(options.request.maxOutputBytes, 24 * 1024),
+		SUBAGENT_DELEGABLE_TOOL_OUTPUT_MAX_BYTES,
 	);
 	const adaptedNames = [...mcpDefinitions, ...externalDefinitions].map((definition) => definition.name);
 	if (new Set(adaptedNames).size !== adaptedNames.length)
@@ -6996,6 +7081,7 @@ export async function createNativeSubagentSession(
 		options.model,
 		childTools,
 		options.unsafeHostExec === true,
+		options.noLifetimeTimeout === true,
 	);
 	const scopedMcpTools = wrapSubagentToolDefinitions([...mcpDefinitions, ...externalDefinitions], policyBox);
 	const created = await createSession({
@@ -7203,6 +7289,8 @@ export interface NativeWriterRunnerOptions {
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	agentDir?: string;
 	artifactRoot?: string;
+	outputArtifactRoot?: string;
+	outputArtifacts?: SubagentOutputArtifactStore;
 }
 
 export interface WriterProgressEvent {
@@ -7225,6 +7313,7 @@ export interface NativeWriterRunOptions {
 	directWorkspace?: boolean;
 	unsafeHostExec?: boolean;
 	signal?: AbortSignal;
+	onAdmitted?: (admission: { runId: string; baseCommit: string; workspaceIsolation: "worktree" | "parent" }) => void;
 	onEvent?: (event: WriterProgressEvent) => void;
 }
 
@@ -7232,11 +7321,14 @@ export class NativeWriterRunner {
 	private readonly createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	private readonly agentDir?: string;
 	private readonly artifactRoot?: string;
+	private readonly outputArtifacts: SubagentOutputArtifactStore;
 
 	constructor(options: NativeWriterRunnerOptions = {}) {
 		this.createSession = options.createSession ?? createAgentSession;
 		this.agentDir = options.agentDir;
 		this.artifactRoot = options.artifactRoot;
+		this.outputArtifacts =
+			options.outputArtifacts ?? new SubagentOutputArtifactStore({ artifactRoot: options.outputArtifactRoot });
 	}
 
 	async run(
@@ -7295,12 +7387,10 @@ export class NativeWriterRunner {
 		let workspace: WriterWorkspace | undefined;
 		let childSession: NativeWriterSession["session"] | undefined;
 		let observedOutputBytes = 0;
-		let timeout: NodeJS.Timeout | undefined;
 		let removeAbortListener: (() => void) | undefined;
 		let unsubscribeChild: (() => void) | undefined;
-		let control: "cancelled" | "timed_out" | "output_truncated" | undefined;
-		let resolveControl: ((reason: "cancelled" | "timed_out" | "output_truncated") => void) | undefined;
-		let outputLimitReached = false;
+		let control: "cancelled" | undefined;
+		let resolveControl: ((reason: "cancelled") => void) | undefined;
 		let patchArtifact: WriterPatchArtifact | undefined;
 		let result: WriterResult = {
 			...base,
@@ -7322,6 +7412,15 @@ export class NativeWriterRunner {
 					}
 				: await createWriterWorkspace(request.cwd, request.baseCommit);
 			emit("workspace_created", "running", directWorkspace ? { diagnostics: ["unsafe_parent_workspace"] } : {});
+			try {
+				options.onAdmitted?.({
+					runId,
+					baseCommit: request.baseCommit,
+					workspaceIsolation: directWorkspace ? "parent" : "worktree",
+				});
+			} catch {
+				// Admission observers cannot alter writer execution.
+			}
 			const isolatedRequest: NormalizedWriterRequest = directWorkspace
 				? request
 				: {
@@ -7358,7 +7457,7 @@ export class NativeWriterRunner {
 					},
 					() => {},
 				);
-				control = startup.kind;
+				if (startup.kind === "cancelled") control = "cancelled";
 				throw new SubagentError(
 					startup.kind === "cancelled" ? "cancellation" : "timeout",
 					`Writer ${startup.kind} during startup.`,
@@ -7379,12 +7478,7 @@ export class NativeWriterRunner {
 							),
 						});
 					} else if (event.type === "message_update") {
-						const outputBytes = Buffer.byteLength(extractAssistantText(childSession?.messages ?? []));
-						observedOutputBytes = outputBytes;
-						if (outputBytes > request.maxOutputBytes && !outputLimitReached) {
-							outputLimitReached = true;
-							resolveControl?.("output_truncated");
-						}
+						observedOutputBytes = Buffer.byteLength(extractAssistantText(childSession?.messages ?? []));
 					}
 				});
 			}
@@ -7399,20 +7493,16 @@ export class NativeWriterRunner {
 					diagnostics: [{ code: "cancellation", message: "Parent cancellation arrived before prompting." }],
 				};
 			} else {
-				const controlPromise = new Promise<"cancelled" | "timed_out" | "output_truncated">(
-					(resolveControlPromise) => {
-						resolveControl = resolveControlPromise;
-					},
-				);
+				const controlPromise = new Promise<"cancelled">((resolveControlPromise) => {
+					resolveControl = resolveControlPromise;
+				});
 				const abortListener = () => resolveControl?.("cancelled");
 				if (options.signal) {
 					options.signal.addEventListener("abort", abortListener, { once: true });
 					removeAbortListener = () => options.signal?.removeEventListener("abort", abortListener);
 				}
-				timeout = setTimeout(() => resolveControl?.("timed_out"), request.timeoutMs);
 				const promptPromise = childSession.prompt(created.prompt, {
 					expandPromptTemplates: false,
-					source: "extension",
 				});
 				void promptPromise.catch(() => {});
 				const outcome = await Promise.race([
@@ -7422,32 +7512,24 @@ export class NativeWriterRunner {
 					),
 					controlPromise.then((reason) => ({ kind: reason })),
 				]);
-				if (outcome.kind === "cancelled" || outcome.kind === "timed_out" || outcome.kind === "output_truncated") {
+				if (outcome.kind === "cancelled") {
 					control = outcome.kind;
 					await abortChildSession(childSession);
 					result = {
 						...base,
-						status:
-							outcome.kind === "cancelled" ? "cancelled" : outcome.kind === "timed_out" ? "timed_out" : "failed",
+						status: "cancelled",
 						observedOutputBytes,
-						summary: `Writer ${outcome.kind}.`,
-						diagnostics: [
-							{
-								code:
-									outcome.kind === "cancelled"
-										? "cancellation"
-										: outcome.kind === "timed_out"
-											? "timeout"
-											: "output_truncated",
-								message: `Writer ${outcome.kind}.`,
-							},
-						],
+						summary: "Writer cancelled.",
+						diagnostics: [{ code: "cancellation", message: "Writer cancelled." }],
 					};
 				} else if (outcome.kind === "error") {
 					throw outcome.error;
 				} else {
 					const rawOutput = extractAssistantText(childSession.messages);
-					const summary = truncateSubagentOutput(rawOutput, request.maxOutputBytes);
+					const output =
+						rawOutput.length > 0
+							? this.outputArtifacts.capture({ ownerSessionId: request.parentSessionId, text: rawOutput })
+							: undefined;
 					const usage = (() => {
 						try {
 							const stats = childSession!.getSessionStats();
@@ -7473,8 +7555,8 @@ export class NativeWriterRunner {
 					result = {
 						...base,
 						status: "completed",
-						summary: summary.text || "Writer completed.",
-						observedOutputBytes: Buffer.byteLength(rawOutput),
+						summary: output?.text || "Writer completed.",
+						observedOutputBytes: output?.originalBytes ?? Buffer.byteLength(rawOutput),
 						diagnostics: [
 							...(directWorkspace
 								? [
@@ -7484,10 +7566,23 @@ export class NativeWriterRunner {
 										},
 									]
 								: []),
-							...(summary.truncated
-								? [{ code: "output_truncated" as const, message: "Writer output was capped." }]
-								: []),
+							...(output?.captureStatus === "artifact_truncated"
+								? [
+										{
+											code: "output_artifact_truncated" as const,
+											message: "The stored writer final answer was truncated.",
+										},
+									]
+								: output?.captureStatus === "artifact_unavailable"
+									? [
+											{
+												code: "output_artifact_unavailable" as const,
+												message: "The writer final answer could not be fully retained.",
+											},
+										]
+									: []),
 						],
+						...(output ? { output } : {}),
 						...(patchArtifact ? { patchArtifact } : {}),
 						...(usage ? { usage } : {}),
 					};
@@ -7503,13 +7598,12 @@ export class NativeWriterRunner {
 						);
 			result = {
 				...base,
-				status: control === "cancelled" ? "cancelled" : control === "timed_out" ? "timed_out" : "failed",
+				status: control === "cancelled" ? "cancelled" : "failed",
 				observedOutputBytes,
-				summary: truncateSubagentOutput(failure.message, request.maxOutputBytes).text,
+				summary: truncateSubagentOutput(failure.message, SUBAGENT_OUTPUT_ARTIFACT_LIMITS.inlineBytes).text,
 				diagnostics: [{ code: failure.code, message: failure.message }],
 			};
 		} finally {
-			if (timeout) clearTimeout(timeout);
 			removeAbortListener?.();
 			unsubscribeChild?.();
 			try {
@@ -7595,8 +7689,10 @@ export function assertIceSubagentBackendPolicy(): void {
 export interface NativeSubagentRunnerOptions {
 	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	agentDir?: string;
-	/** Root for bounded oversized child-report captures. */
+	/** Legacy root for historical report-artifact decoding during migration. */
 	artifactRoot?: string;
+	outputArtifactRoot?: string;
+	outputArtifacts?: SubagentOutputArtifactStore;
 	/** Optional parent-owned MCP adapter supplied by the host integration. */
 	mcpAdapter?: IceSubagentMcpAdapter;
 	liveSessionRegistry?: SubagentLiveSessionRegistry;
@@ -7623,6 +7719,10 @@ export interface NativeSubagentRunOptions {
 	onManagedResult?: (result: SubagentResult) => void | Promise<void>;
 	/** Launch-time admission handle; invoked once when supervision starts for this run. */
 	onManagedHandle?: (handle: SubagentManagedHandle) => void;
+	/** Supervise activity and cancellation without expiring a running child. */
+	noLifetimeTimeout?: boolean;
+	/** Durable result ownership is used only by delegate_async. */
+	outputArtifactLifecycle?: "process_local" | "durable";
 	/** Parent-owned lifecycle hook runtime; absent when the feature is disabled. */
 	hookRuntime?: SubagentHookRuntime;
 	/** Optional per-run parent-owned MCP dispatch override. */
@@ -7697,6 +7797,7 @@ export class NativeSubagentRunner {
 	private readonly createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 	private readonly agentDir?: string;
 	private readonly artifactRoot?: string;
+	private readonly outputArtifacts: SubagentOutputArtifactStore;
 	private readonly liveSessionRegistry?: SubagentLiveSessionRegistry;
 	private readonly agentViewBridge?: IceAgentViewBridge;
 	private readonly supervisorRegistry: SubagentRunSupervisorRegistry<SubagentResult>;
@@ -7718,11 +7819,30 @@ export class NativeSubagentRunner {
 		this.createSession = options.createSession ?? createAgentSession;
 		this.agentDir = options.agentDir;
 		this.artifactRoot = options.artifactRoot;
+		this.outputArtifacts =
+			options.outputArtifacts ??
+			new SubagentOutputArtifactStore({ artifactRoot: options.outputArtifactRoot ?? options.artifactRoot });
 		this.liveSessionRegistry = options.liveSessionRegistry;
 		this.agentViewBridge = options.agentViewBridge;
 		this.mcpAdapter = options.mcpAdapter;
 		this.runtimeManagementEnabled = options.supervisorRegistry !== undefined;
 		this.supervisorRegistry = options.supervisorRegistry ?? new SubagentRunSupervisorRegistry<SubagentResult>();
+	}
+
+	private releaseOutputArtifact(result: SubagentResult, parentSessionId: string, referenceId = "capture"): void {
+		if (!result.output?.artifact) return;
+		this.outputArtifacts.release({
+			ownerSessionId: parentSessionId,
+			artifactId: result.output.artifact.id,
+			referenceId,
+		});
+	}
+
+	private forgetRetainedManagedResult(runId: string): void {
+		const retained = this.retainedManagedResults.get(runId);
+		if (!retained) return;
+		this.retainedManagedResults.delete(runId);
+		this.releaseOutputArtifact(retained.result, retained.parentSessionId);
 	}
 
 	getRuntimeAttention(runId: string, parentSessionId: string): SubagentRuntimeAttention | undefined {
@@ -7852,9 +7972,8 @@ export class NativeSubagentRunner {
 	 * Retain the same child under management so the parent can continue other
 	 * work, without a replacement child and without replaying the initial prompt.
 	 * The same run ID, session, model, profile, scope, and tool authority
-	 * continue. A running child is retained in place and no budget changes; a
-	 * paused child resumes under the separate bounded retention pool, never the
-	 * extension reserve, so detaching cannot silently spend extension budget.
+	 * continue. Detach is a bookkeeping decision only: it never changes runtime
+	 * authority, budget, or lifecycle state.
 	 * Idempotent per run.
 	 */
 	detachRuntime(runId: string, parentSessionId: string): SubagentManagedObservation | undefined {
@@ -7879,24 +7998,7 @@ export class NativeSubagentRunner {
 				"The selected subagent is already terminal; detach is live-only.",
 			);
 		}
-		if (!this.detachedRuns.has(runId)) {
-			if (state === "awaiting_extension") {
-				const retentionMs = Math.min(
-					SUBAGENT_DETACH_RETENTION_MS,
-					supervisor.getSnapshot().remainingRetentionMs ?? 0,
-				);
-				if (retentionMs < 1_000) return undefined;
-				const continuation = supervisor.retain(retentionMs);
-				this.detachedRuns.set(runId, { promise: continuation });
-				// The continuation settles through the runner managed-terminal path;
-				// swallow only the detached rejection so it cannot become unhandled.
-				void continuation.catch(() => {});
-			} else {
-				// Retain in place: the child keeps running under its admitted budget
-				// and the parent simply stops blocking on it.
-				this.detachedRuns.set(runId, {});
-			}
-		}
+		if (!this.detachedRuns.has(runId)) this.detachedRuns.set(runId, {});
 		return this.peekRuntime(runId, parentSessionId);
 	}
 
@@ -7919,13 +8021,12 @@ export class NativeSubagentRunner {
 	noteManagedTerminalResult(runId: string, parentSessionId: string, result: SubagentResult): boolean {
 		if (this.activeResumeClaims.has(runId)) return false;
 		if (this.retainedManagedResults.has(runId)) return false;
-		if (result.status === "needs_time") return false;
 		this.retainedManagedResults.set(runId, { result, parentSessionId });
 		this.detachedRuns.delete(runId);
 		while (this.retainedManagedResults.size > SUBAGENT_RETAINED_RESULT_LIMIT) {
 			const oldest = this.retainedManagedResults.keys().next().value;
 			if (oldest === undefined) break;
-			this.retainedManagedResults.delete(oldest);
+			this.forgetRetainedManagedResult(oldest);
 		}
 		return true;
 	}
@@ -7948,27 +8049,19 @@ export class NativeSubagentRunner {
 		if (!this.runtimeManagementEnabled) return;
 		// A retry-safe startup failure is not terminal for the run: the shared
 		// recovery loop re-attempts the same run ID.
-		if (result.status === "needs_time" || result.retrySafeStartup === true) return;
+		if (result.retrySafeStartup === true) return;
 		// Retain before the terminal transition wakes any pending management wait,
 		// so a waiter never observes terminal state without a retained result.
 		const firstPublication = this.noteManagedTerminalResult(runId, parentSessionId, result);
 		this.getOwnedSupervisor(runId, parentSessionId)?.finish(result, result.status);
 		if (firstPublication && onManagedResult) {
-			// A run that reached its terminal state without an extension or stop
-			// decision never passes through finalizeManaged, so its durable observer
-			// is notified here to keep terminal publication exactly once.
+			// Runner-owned terminal publication notifies durable observers exactly once.
 			try {
 				await onManagedResult(result);
 			} catch {
 				// Durable/job observers cannot change a terminal child result.
 			}
 		}
-	}
-
-	async extendRuntime(runId: string, parentSessionId: string, additionalMs: number): Promise<SubagentResult> {
-		const supervisor = this.getOwnedSupervisor(runId, parentSessionId);
-		if (!supervisor) throw new SubagentError("child_protocol_failure", "The selected subagent is not extendable.");
-		return supervisor.extend(additionalMs);
 	}
 
 	async stopRuntime(runId: string, parentSessionId: string): Promise<SubagentResult> {
@@ -8025,7 +8118,7 @@ export class NativeSubagentRunner {
 		this.supervisorOwners.clear();
 		this.followUpRequests.clear();
 		this.detachedRuns.clear();
-		this.retainedManagedResults.clear();
+		for (const runId of [...this.retainedManagedResults.keys()]) this.forgetRetainedManagedResult(runId);
 		// Deterministic cleanup: await every retained session's shutdown event and dispose
 		// rather than returning while disposal is still in flight.
 		await Promise.allSettled(
@@ -8047,7 +8140,10 @@ export class NativeSubagentRunner {
 	/** Drops any retained entry owning this exact child session, so no stale handle survives. */
 	private dropRetainedSession(session: CreateAgentSessionResult["session"]): void {
 		for (const [key, value] of this.retainedChildren) {
-			if (value.session === session) this.retainedChildren.delete(key);
+			if (value.session === session) {
+				this.retainedChildren.delete(key);
+				this.forgetRetainedManagedResult(key);
+			}
 		}
 	}
 
@@ -8061,9 +8157,9 @@ export class NativeSubagentRunner {
 			if (oldest.done) break;
 			const evicted = this.retainedChildren.get(oldest.value);
 			this.retainedChildren.delete(oldest.value);
-			// Eviction forgets the managed terminal observation as well, so a peek
-			// cannot outlive the retained session it describes.
-			this.retainedManagedResults.delete(oldest.value);
+			// Eviction forgets the managed terminal observation and its output reference
+			// as well, so a peek cannot outlive the retained session it describes.
+			this.forgetRetainedManagedResult(oldest.value);
 			this.detachedRuns.delete(oldest.value);
 			if (evicted) await shutdownChildSession(evicted.session);
 		}
@@ -8136,7 +8232,7 @@ export class NativeSubagentRunner {
 		// terminal observation is forgotten at the same instant so the superseded run id
 		// cannot keep serving a stale peekable result while its session is live again.
 		this.retainedChildren.delete(runId);
-		this.retainedManagedResults.delete(runId);
+		this.forgetRetainedManagedResult(runId);
 		this.detachedRuns.delete(runId);
 		this.activeResumeClaims.set(runId, request.runId);
 		// Defence in depth beside `revalidateResumedChild`: the resumed run's policy carries the
@@ -8247,7 +8343,7 @@ export class NativeSubagentRunner {
 			);
 		}
 		this.retainedChildren.delete(runId);
-		this.retainedManagedResults.delete(runId);
+		this.forgetRetainedManagedResult(runId);
 		this.detachedRuns.delete(runId);
 		this.agentViewBridge?.removeHistoricalSnapshot(runId);
 		await shutdownChildSession(retained.session);
@@ -8298,7 +8394,7 @@ export class NativeSubagentRunner {
 		options: NativeSubagentRunOptions = {},
 	): Promise<SubagentResult> {
 		const result = await this.runResolvedInternal(normalized, parentActiveTools, options);
-		if (result.status !== "needs_time") await flushSubagentHookObservations(options.hookRuntime);
+		await flushSubagentHookObservations(options.hookRuntime);
 		const records = options.hookRuntime?.records;
 		return records && records.length > 0 ? { ...result, hookRecords: Object.freeze([...records]) } : result;
 	}
@@ -8310,7 +8406,11 @@ export class NativeSubagentRunner {
 	): Promise<SubagentResult> {
 		const runId = normalized.runId;
 		const publicManagementEnabled = this.runtimeManagementEnabled && options.management !== "internal";
-		const agentViewEnabled = options.management !== "internal";
+		// Batch/review children are internal for lifecycle management, but they still need
+		// live observability when the host installed the view registry. Internal means
+		// "no public handle or retention", not "hide the work while it is running".
+		const agentViewEnabled = options.management !== "internal" || this.liveSessionRegistry !== undefined;
+		const historicalAgentViewEnabled = options.management !== "internal";
 		const attemptDeadline = Date.now() + normalized.timeoutMs;
 		const profile = normalized.profile;
 		const startedAt = Date.now();
@@ -8357,9 +8457,8 @@ export class NativeSubagentRunner {
 		};
 		let childSession: NativeSubagentSession["session"] | undefined;
 		let observedOutputBytes = 0;
-		let control: "cancelled" | "timed_out" | "output_truncated" | undefined;
-		let resolveControl: ((reason: "cancelled" | "timed_out" | "output_truncated") => void) | undefined;
-		let outputLimitReached = false;
+		let control: "cancelled" | "timed_out" | undefined;
+		let resolveControl: ((reason: "cancelled" | "timed_out") => void) | undefined;
 		let removeAbortListener: (() => void) | undefined;
 		let supervisor: SubagentRunSupervisor<SubagentResult> | undefined;
 		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
@@ -8392,7 +8491,14 @@ export class NativeSubagentRunner {
 			),
 		);
 		const requestWrapUpIfNeeded = (): boolean => {
-			if (wrapUpRequested || wrapUpPromptStarted || reportOnly || liveControl?.isControlled()) return false;
+			if (
+				options.noLifetimeTimeout ||
+				wrapUpRequested ||
+				wrapUpPromptStarted ||
+				reportOnly ||
+				liveControl?.isControlled()
+			)
+				return false;
 			const wallThreshold = Date.now() >= attemptDeadline - wrapUpWallReserveMs;
 			if (!wallThreshold) return false;
 			wrapUpRequested = true;
@@ -8424,7 +8530,7 @@ export class NativeSubagentRunner {
 				unsubscribeChild?.();
 				unsubscribeChild = undefined;
 				liveControl?.markTerminal();
-				if (agentViewEnabled && childSession && terminalStatus) {
+				if (historicalAgentViewEnabled && childSession && terminalStatus) {
 					presentation = presentation
 						? normalizeIceAgentViewPresentation({ ...presentation, compacting: false })
 						: presentation;
@@ -8526,32 +8632,22 @@ export class NativeSubagentRunner {
 			observedOutputBytes = Buffer.byteLength(text);
 			return text;
 		};
-		const spillAssistantOutput = (
+		const materializeOutput = (
 			text: string,
-			contentType: SubagentReportArtifact["contentType"] = "text/plain",
-		): SubagentReportArtifact | undefined =>
-			Buffer.byteLength(text, "utf8") > normalized.maxOutputBytes
-				? writeSubagentReportArtifact({
-						runId,
-						content: text,
-						artifactRoot: this.artifactRoot,
-						contentType,
-					})
-				: undefined;
-		const reportSpillDiagnostic = (
-			text: string,
-			artifact: SubagentReportArtifact | undefined,
-		): SubagentDiagnostic | undefined => {
-			if (Buffer.byteLength(text, "utf8") <= normalized.maxOutputBytes) return undefined;
-			return artifact
-				? {
-						code: "report_spilled",
-						message: `Oversized child output was preserved at ${artifact.path} (${artifact.originalBytes} bytes${artifact.truncated ? ", artifact truncated" : ""}).`,
-					}
-				: {
-						code: "report_artifact_failure",
-						message: "Oversized child output could not be preserved as a local artifact.",
-					};
+			contentType: "text/plain" | "application/json" = "text/plain",
+		): SubagentOutput =>
+			this.outputArtifacts.capture({
+				ownerSessionId: normalized.parentSessionId,
+				text,
+				contentType,
+				lifecycle: options.outputArtifactLifecycle ?? "process_local",
+			});
+		const releaseOutput = (result: SubagentResult): void => {
+			this.releaseOutputArtifact(
+				result,
+				normalized.parentSessionId,
+				options.outputArtifactLifecycle === "durable" ? "durable" : "capture",
+			);
 		};
 		const observeUsage = (): SubagentUsage | undefined => {
 			if (!childSession) return undefined;
@@ -8693,6 +8789,7 @@ export class NativeSubagentRunner {
 						{
 							request: normalized,
 							parentActiveTools,
+							noLifetimeTimeout: options.noLifetimeTimeout,
 							model: options.model,
 							modelRuntime: options.modelRuntime,
 							agentDir: this.agentDir,
@@ -8721,16 +8818,23 @@ export class NativeSubagentRunner {
 					},
 					() => {},
 				);
-				control = startup.kind;
-				const status = startup.kind === "cancelled" ? "cancelled" : "timed_out";
-				emit(status === "cancelled" ? "subagent_cancelled" : "subagent_timed_out", status);
+				if (startup.kind === "cancelled") control = "cancelled";
+				const status = startup.kind === "cancelled" ? "cancelled" : "failed";
+				emit(status === "cancelled" ? "subagent_cancelled" : "subagent_failed", status);
 				return {
 					...base,
 					status,
-					summary: `Subagent ${status} during startup.`,
+					summary:
+						startup.kind === "cancelled"
+							? "Subagent cancelled during startup."
+							: "Subagent startup deadline exceeded.",
 					partial: true,
 					diagnostics: [
-						{ code: status === "cancelled" ? "cancellation" : "timeout", message: `Child ${status}.` },
+						{
+							code: status === "cancelled" ? "cancellation" : "timeout",
+							message:
+								status === "cancelled" ? "Child cancelled during startup." : "Child startup deadline exceeded.",
+						},
 					],
 				};
 			}
@@ -8748,7 +8852,6 @@ export class NativeSubagentRunner {
 				protocolReportPending: normalized.reportMode === "structured_report",
 				handoffMessageMarker: SUBAGENT_HANDOFF_MARKER,
 				finalizationMessageMarker: INTERACTIVE_FINAL_REPORT_MARKER,
-				timeoutContinuationMessageMarker: SUBAGENT_EXTENSION_MARKER,
 				wrapUpMessageMarker: SUBAGENT_WRAP_UP_MARKER,
 				handoffMessageIndex: childSession.messages.length,
 			});
@@ -8850,12 +8953,7 @@ export class NativeSubagentRunner {
 						willRetry: event.willRetry,
 					});
 				} else if (event.type === "message_update") {
-					const outputBytes = Buffer.byteLength(extractAssistantText(childSession?.messages ?? []));
-					observedOutputBytes = outputBytes;
-					if (outputBytes > normalized.maxOutputBytes && !outputLimitReached) {
-						outputLimitReached = true;
-						resolveControl?.("output_truncated");
-					}
+					observedOutputBytes = Buffer.byteLength(extractAssistantText(childSession?.messages ?? []));
 					if (Date.now() - lastProgressAt >= 250) {
 						lastProgressAt = Date.now();
 						emit("subagent_progress", "running");
@@ -8889,21 +8987,14 @@ export class NativeSubagentRunner {
 				};
 			}
 
-			let resumeAfterExtension: (() => Promise<SubagentResult>) | undefined;
 			let stopAfterSupervisor: ((reason: SubagentSupervisorStopReason) => Promise<SubagentResult>) | undefined;
 			const baseLiveControl = liveControl;
 			if (publicManagementEnabled) {
 				supervisor = new SubagentRunSupervisor<SubagentResult>({
 					runId,
 					childSessionId: childSession.sessionId,
-					initialTimeoutMs: Math.max(1, attemptDeadline - Date.now()),
 					phase: "working",
 					abort: abortChild,
-					resume: async () => {
-						baseLiveControl?.resumeFromExtension?.();
-						if (!resumeAfterExtension) throw new Error(`Subagent run ${runId} has no resumable continuation.`);
-						return decorateSubagentResult(await resumeAfterExtension());
-					},
 					stop: async (reason) => {
 						if (!stopAfterSupervisor) throw new Error(`Subagent run ${runId} has no terminal continuation.`);
 						return decorateSubagentResult(await stopAfterSupervisor(reason));
@@ -8913,8 +9004,6 @@ export class NativeSubagentRunner {
 							...snapshot,
 							lastActivities: Object.freeze(snapshot.lastActivities.slice(-3)),
 						};
-						if (snapshot.state === "awaiting_extension") baseLiveControl?.markAwaitingExtension?.();
-						else if (snapshot.state === "running") baseLiveControl?.resumeFromExtension?.();
 						updatePresentation({ runtimeAttention: attention });
 						try {
 							options.onRuntimeAttention?.(attention);
@@ -8953,8 +9042,6 @@ export class NativeSubagentRunner {
 								}
 							},
 							getRuntimeAttention: () => supervisor?.getSnapshot(),
-							extendRuntime: (additionalMs) =>
-								this.extendRuntime(runId, normalized.parentSessionId, additionalMs),
 							stopRuntime: () => this.stopRuntime(runId, normalized.parentSessionId),
 						}
 					: undefined;
@@ -8987,27 +9074,17 @@ export class NativeSubagentRunner {
 			type PromptOutcome =
 				| { kind: "completed" }
 				| { kind: "error"; error: unknown }
-				| { kind: "cancelled" | "timed_out" | "output_truncated" }
-				| { kind: "needs_time" };
-			const controlPromise = new Promise<"cancelled" | "timed_out" | "output_truncated">((resolveControlPromise) => {
+				| { kind: "cancelled" | "timed_out" };
+			const controlPromise = new Promise<"cancelled" | "timed_out">((resolveControlPromise) => {
 				resolveControl = resolveControlPromise;
 			});
 			const abortListener = (): void => {
 				resolveControl?.("cancelled");
-				if (supervisor?.stateValue === "awaiting_extension") {
-					void supervisor.stop("cancelled").catch(() => {});
-				}
 			};
 			if (options.signal) {
 				options.signal.addEventListener("abort", abortListener, { once: true });
 				removeAbortListener = () => options.signal?.removeEventListener("abort", abortListener);
 			}
-			if (!supervisor)
-				timeout = globalThis.setTimeout(
-					() => resolveControl?.("timed_out"),
-					Math.max(0, attemptDeadline - Date.now()),
-				);
-
 			const awaitPrompt = async (promptPromise: Promise<void>): Promise<PromptOutcome> => {
 				void promptPromise.catch(() => {});
 				const races: Array<Promise<PromptOutcome>> = [
@@ -9017,7 +9094,6 @@ export class NativeSubagentRunner {
 					),
 					controlPromise.then((reason) => ({ kind: reason })),
 				];
-				if (supervisor) races.push(supervisor.getTimeoutPromise().then(() => ({ kind: "needs_time" as const })));
 				return Promise.race(races);
 			};
 			let controlledFailurePromise: Promise<SubagentResult> | undefined;
@@ -9026,9 +9102,7 @@ export class NativeSubagentRunner {
 			const missingDeliverableTarget = structuredReportMode
 				? "a valid final envelope"
 				: "a nonempty final assistant answer";
-			const controlledFailure = (
-				reason: "cancelled" | "timed_out" | "output_truncated",
-			): Promise<SubagentResult> => {
+			const controlledFailure = (reason: "cancelled" | "timed_out"): Promise<SubagentResult> => {
 				if (controlledFailurePromise) return controlledFailurePromise;
 				controlledFailurePromise = (async () => {
 					control = reason;
@@ -9047,26 +9121,20 @@ export class NativeSubagentRunner {
 							? structuredReportMode
 								? `Child reached its ${normalized.timeoutMs} ms wall-clock timeout before a verified bounded report completed.`
 								: `Child reached its ${normalized.timeoutMs} ms wall-clock timeout before a final assistant answer completed.`
-							: reason === "cancelled"
-								? structuredReportMode
-									? "Child was cancelled before a verified bounded report completed."
-									: "Child was cancelled before a final assistant answer completed."
-								: structuredReportMode
-									? "Child exceeded the bounded output budget before a valid report completed."
-									: "Child exceeded the bounded output budget before a final assistant answer completed.";
+							: structuredReportMode
+								? "Child was cancelled before a verified bounded report completed."
+								: "Child was cancelled before a final assistant answer completed.";
 					updatePresentation({
 						finalizationStarted: false,
 						protocolReportPending: false,
 						finalResult: { status, diagnostic: diagnosticMessage },
 					});
-					const partialReport = observeAssistantText();
-					const reportArtifact = spillAssistantOutput(partialReport);
-					const spillDiagnostic = reportSpillDiagnostic(partialReport, reportArtifact);
+					observeAssistantText();
 					return {
 						...base,
 						childSessionId: childSession!.sessionId,
 						status,
-						summary: truncateSubagentOutput(partialReport, normalized.maxOutputBytes).text,
+						summary: diagnosticMessage,
 						observedOutputBytes,
 						partial: true,
 						workArtifact: buildWorkArtifact(
@@ -9081,18 +9149,11 @@ export class NativeSubagentRunner {
 							},
 							{ terminal: true },
 						),
-						...(reportArtifact ? { reportArtifact } : {}),
 						diagnostics: [
 							{
-								code:
-									reason === "cancelled"
-										? "cancellation"
-										: reason === "timed_out"
-											? "timeout"
-											: "output_truncated",
+								code: reason === "cancelled" ? "cancellation" : "timeout",
 								message: diagnosticMessage,
 							},
-							...(spillDiagnostic ? [spillDiagnostic] : []),
 						],
 					};
 				})();
@@ -9105,9 +9166,7 @@ export class NativeSubagentRunner {
 					message: failure.message,
 					...(failure.retryable ? { retryable: true } : {}),
 				};
-				const assistantText = childSession ? observeAssistantText() : "";
-				const reportArtifact = childSession ? spillAssistantOutput(assistantText) : undefined;
-				const spillDiagnostic = childSession ? reportSpillDiagnostic(assistantText, reportArtifact) : undefined;
+				if (childSession) observeAssistantText();
 				const usage = observeUsage();
 				const status = control === "cancelled" ? "cancelled" : control === "timed_out" ? "timed_out" : "failed";
 				if (childSession) {
@@ -9129,9 +9188,7 @@ export class NativeSubagentRunner {
 					...base,
 					childSessionId: childSession?.sessionId,
 					status,
-					summary: childSession
-						? truncateSubagentOutput(assistantText, normalized.maxOutputBytes).text
-						: diagnostic.message,
+					summary: diagnostic.message,
 					observedOutputBytes,
 					partial: status !== "failed",
 					...(childSession
@@ -9145,15 +9202,14 @@ export class NativeSubagentRunner {
 								),
 							}
 						: {}),
-					...(reportArtifact ? { reportArtifact } : {}),
-					diagnostics: [diagnostic, ...(spillDiagnostic ? [spillDiagnostic] : [])],
+					diagnostics: [diagnostic],
 					...(usage ? { usage } : {}),
 				};
 			};
 			observeTerminalHook = async (result?: SubagentResult): Promise<void> => {
 				if (terminalHookObserved || !options.hookRuntime) return;
 				const status = result?.status ?? terminalStatus;
-				if (!status || status === "needs_time") return;
+				if (!status) return;
 				terminalHookObserved = true;
 				const event =
 					status === "completed"
@@ -9175,7 +9231,6 @@ export class NativeSubagentRunner {
 				);
 			};
 			const finalizeManaged = async (result: SubagentResult): Promise<SubagentResult> => {
-				if (result.status === "needs_time") return result;
 				// An explicit parent control decision owns the terminal
 				// classification: an aborted child turn cannot downgrade a
 				// cancellation into a generic failure or a silent completion.
@@ -9217,72 +9272,21 @@ export class NativeSubagentRunner {
 				}
 				return decorated;
 			};
-			const retainForExtension = (continuation: () => Promise<SubagentResult>): SubagentResult => {
-				if (!supervisor) throw new Error("A subagent timeout continuation requires an active supervisor.");
-				resumeAfterExtension = async () => {
-					let result: SubagentResult;
-					try {
-						result = await continuation();
-					} catch (error) {
-						result = buildFailureResult(error);
-					}
-					return result.status === "needs_time" ? result : finalizeManaged(result);
-				};
-				const usage = observeUsage();
-				if (usage) supervisor.setUsage(usage);
-				const snapshot = supervisor.getSnapshot();
-				const attention = Object.freeze({
-					...snapshot,
-					lastActivities: Object.freeze(snapshot.lastActivities.slice(-3)),
-				});
-				updatePresentation({ runtimeAttention: attention });
-				emit("subagent_needs_time", "needs_time", undefined, undefined, undefined, attention);
-				dispatchSubagentHookObservation(
-					options.hookRuntime!,
-					"subagent.attention",
-					{
-						phase: attention.phase,
-						state: attention.state,
-						remainingExtendableMs: attention.remainingExtendableMs,
-					},
-					options.signal,
-				);
-				return decorateSubagentResult({
-					...base,
-					childSessionId: childSession!.sessionId,
-					status: "needs_time",
-					summary: `Child reached its ${normalized.timeoutMs} ms execution/finalization budget and is awaiting an explicit extension or stop decision.`,
-					observedOutputBytes,
-					partial: true,
-					attention,
-					workArtifact: buildWorkArtifact(
-						{
-							status: "missing",
-							diagnostic: `No final ${finalDeliverableNoun} yet: the same live child is awaiting an extension or stop decision.`,
-						},
-						{ terminal: false },
-					),
-					diagnostics: [{ code: "timeout", message: "Child is awaiting an explicit runtime time decision." }],
-				});
-			};
 			stopAfterSupervisor = async (reason) => {
-				const controlReason = reason === "cancelled" ? "cancelled" : "timed_out";
-				resolveControl?.(controlReason);
-				const result = await controlledFailure(controlReason);
+				resolveControl?.(reason);
+				const result = await controlledFailure(reason);
 				return finalizeManaged(result);
 			};
 			const awaitInteractiveBoundary = async (
 				waitPromise: Promise<void>,
-			): Promise<"cancelled" | "timed_out" | "output_truncated" | "needs_time" | undefined> => {
-				const races: Array<Promise<"cancelled" | "timed_out" | "output_truncated" | "needs_time" | undefined>> = [
+			): Promise<"cancelled" | "timed_out" | undefined> => {
+				const races: Array<Promise<"cancelled" | "timed_out" | undefined>> = [
 					waitPromise.then(() => undefined),
 					controlPromise.then((reason) => reason),
 				];
-				if (supervisor) races.push(supervisor.getTimeoutPromise().then(() => "needs_time"));
 				return Promise.race(races);
 			};
 
-			let runContinuation: () => Promise<SubagentResult>;
 			let runAfterInitial: (reportStartIndex: number) => Promise<SubagentResult>;
 			let runWrapUp: () => Promise<SubagentResult>;
 			let runFinalization: () => Promise<SubagentResult>;
@@ -9301,7 +9305,11 @@ export class NativeSubagentRunner {
 						),
 					);
 				}
-				const summary = truncateSubagentOutput(report.summary, normalized.maxOutputBytes);
+				const summary = truncateSubagentOutput(report.summary, SUBAGENT_OUTPUT_ARTIFACT_LIMITS.inlineBytes);
+				const output = materializeOutput(
+					rawReportForArtifact ?? JSON.stringify(report) ?? "{}",
+					"application/json",
+				);
 				let finalReportMessageIndex = -1;
 				if (lastAssistant) {
 					for (let index = childSession!.messages.length - 1; index >= 0; index -= 1) {
@@ -9317,12 +9325,11 @@ export class NativeSubagentRunner {
 					childSessionId: childSession!.sessionId,
 					status: "completed",
 					summary: summary.text,
-					observedOutputBytes,
+					observedOutputBytes: output.originalBytes,
 					partial: false,
-					truncated: summary.truncated,
-					diagnostics: summary.truncated
-						? [{ code: "output_truncated", message: "Child output was capped." }]
-						: [],
+					truncated: summary.truncated || output.inlineTruncated,
+					diagnostics: [],
+					output,
 					evidence: { paths: report.paths },
 					findings: report.findings.length > 0 ? report.findings : undefined,
 					...(report.requirementClaims.length > 0 ? { requirementClaims: report.requirementClaims } : {}),
@@ -9330,44 +9337,7 @@ export class NativeSubagentRunner {
 					observedTurns,
 					...(usage ? { usage } : {}),
 				};
-				let serializedResultBytes: number;
-				try {
-					serializedResultBytes = Buffer.byteLength(JSON.stringify(candidateResult));
-				} catch {
-					return protocolFailureResult(
-						"malformed",
-						"The parent-facing result envelope could not be serialized as finite JSON.",
-						JSON.stringify(report),
-					);
-				}
-				if (serializedResultBytes > normalized.maxOutputBytes) {
-					return protocolFailureResult(
-						"truncated",
-						"The complete parent-facing result envelope exceeded the approved UTF-8 output budget.",
-						rawReportForArtifact ?? JSON.stringify(report),
-					);
-				}
-				const completedResult: SubagentResult = {
-					...candidateResult,
-					// W17: the observed result size is the complete serialized envelope,
-					// not only the model's final text.
-					observedOutputBytes: serializedResultBytes,
-				};
-				try {
-					if (Buffer.byteLength(JSON.stringify(completedResult)) > normalized.maxOutputBytes) {
-						return protocolFailureResult(
-							"truncated",
-							"The complete parent-facing result envelope exceeded the approved UTF-8 output budget.",
-							rawReportForArtifact ?? JSON.stringify(report),
-						);
-					}
-				} catch {
-					return protocolFailureResult(
-						"malformed",
-						"The parent-facing result envelope could not be serialized as finite JSON.",
-						JSON.stringify(report),
-					);
-				}
+				const completedResult: SubagentResult = candidateResult;
 				try {
 					await dispatchSubagentHookDecision(
 						options.hookRuntime,
@@ -9455,19 +9425,20 @@ export class NativeSubagentRunner {
 						rawAnswer,
 					);
 				}
-				const answer = truncateSubagentOutput(normalizePlainFinalAnswer(rawAnswer), normalized.maxOutputBytes);
+				const finalAnswer = normalizePlainFinalAnswer(rawAnswer);
+				const output = materializeOutput(finalAnswer);
+				const answer = truncateSubagentOutput(finalAnswer, SUBAGENT_OUTPUT_ARTIFACT_LIMITS.inlineBytes);
 				const usage = observeUsage();
 				const candidateResult: SubagentResult = {
 					...base,
 					childSessionId: childSession!.sessionId,
 					status: "completed",
 					summary: answer.text,
-					observedOutputBytes: Buffer.byteLength(answer.text, "utf8"),
+					observedOutputBytes: output.originalBytes,
 					partial: false,
-					truncated: answer.truncated,
-					diagnostics: answer.truncated
-						? [{ code: "output_truncated", message: "Child final answer was capped to the output budget." }]
-						: [],
+					truncated: answer.truncated || output.inlineTruncated,
+					diagnostics: [],
+					output,
 					// Runtime-owned bounded telemetry for plain answers: records the
 					// touched-path view and the plain terminal state. The "plain"
 					// status is filtered out of parent-facing artifact rows.
@@ -9539,8 +9510,7 @@ export class NativeSubagentRunner {
 				const candidates = [...extractCandidateEvidencePaths(rawReport)]
 					.filter((path, index, all) => all.indexOf(path) === index)
 					.slice(0, CANDIDATE_EVIDENCE_PATH_LIMIT);
-				const reportArtifact = spillAssistantOutput(rawReport, "application/json");
-				const spillDiagnostic = reportSpillDiagnostic(rawReport, reportArtifact);
+				const output = rawReport.trim().length > 0 ? materializeOutput(rawReport, "application/json") : undefined;
 				const artifact = buildWorkArtifact(
 					{ status: protocolStatus, diagnostic },
 					{
@@ -9572,11 +9542,8 @@ export class NativeSubagentRunner {
 					observedOutputBytes,
 					partial: false,
 					workArtifact: artifact,
-					...(reportArtifact ? { reportArtifact } : {}),
-					diagnostics: [
-						{ code: "report_protocol_failure", message: diagnostic },
-						...(spillDiagnostic ? [spillDiagnostic] : []),
-					],
+					...(output ? { output } : {}),
+					diagnostics: [{ code: "report_protocol_failure", message: diagnostic }],
 					...(usage ? { usage } : {}),
 				};
 			};
@@ -9604,7 +9571,11 @@ export class NativeSubagentRunner {
 						rawReport,
 					);
 				}
-				const outcome = parseSubagentReportOutcome(rawReport, normalized.maxOutputBytes, normalized.outputSchema);
+				const outcome = parseSubagentReportOutcome(
+					rawReport,
+					SUBAGENT_REPORT_PARSER_LIMITS.maxBytes,
+					normalized.outputSchema,
+				);
 				if (outcome.kind === "valid") {
 					return await completeFromParsedReport(outcome.report, lastAssistant, rawReport);
 				}
@@ -9620,10 +9591,7 @@ export class NativeSubagentRunner {
 			 * maximum one retry, no implementation replay. Never triggered for
 			 * cancellation, authority failure, or terminal timeout.
 			 */
-			const attemptReportRepair = async (
-				reportStartIndex: number,
-				preserved: SubagentResult,
-			): Promise<SubagentResult> => {
+			const attemptReportRepair = async (preserved: SubagentResult): Promise<SubagentResult> => {
 				const session = childSession!;
 				const previousTools = (() => {
 					try {
@@ -9649,14 +9617,8 @@ export class NativeSubagentRunner {
 						}),
 					);
 					if (observedTurns === turnsBefore) observedTurns += 1;
-					if (outcome.kind === "needs_time") {
-						return retainForExtension(() => attemptReportRepair(reportStartIndex, preserved));
-					}
-					if (
-						outcome.kind === "cancelled" ||
-						outcome.kind === "timed_out" ||
-						outcome.kind === "output_truncated"
-					) {
+					if (outcome.kind === "cancelled" || outcome.kind === "timed_out") {
+						releaseOutput(preserved);
 						return controlledFailure(outcome.kind);
 					}
 					if (outcome.kind === "error") {
@@ -9675,14 +9637,16 @@ export class NativeSubagentRunner {
 					observedOutputBytes = Math.max(observedOutputBytes, Buffer.byteLength(rawRepair));
 					const repairOutcome = parseSubagentReportOutcome(
 						rawRepair,
-						normalized.maxOutputBytes,
+						SUBAGENT_REPORT_PARSER_LIMITS.maxBytes,
 						normalized.outputSchema,
 					);
 					if (repairOutcome.kind === "valid") {
 						const lastAssistant = [...session.messages.slice(repairStartIndex)]
 							.reverse()
 							.find((message) => message.role === "assistant") as AssistantMessage | undefined;
-						return await completeFromParsedReport(repairOutcome.report, lastAssistant, rawRepair);
+						const repaired = await completeFromParsedReport(repairOutcome.report, lastAssistant, rawRepair);
+						releaseOutput(preserved);
+						return repaired;
 					}
 					return {
 						...preserved,
@@ -9712,7 +9676,7 @@ export class NativeSubagentRunner {
 				);
 				if (!protocolFailed || reportRepairAttempted) return parsed;
 				reportRepairAttempted = true;
-				return attemptReportRepair(reportStartIndex, parsed);
+				return attemptReportRepair(parsed);
 			};
 			runWrapUp = async (): Promise<SubagentResult> => {
 				wrapUpPromptStarted = true;
@@ -9733,8 +9697,7 @@ export class NativeSubagentRunner {
 					}),
 				);
 				if (observedTurns === turnsBefore) observedTurns += 1;
-				if (outcome.kind === "needs_time") return retainForExtension(runWrapUp);
-				if (outcome.kind === "cancelled" || outcome.kind === "timed_out" || outcome.kind === "output_truncated") {
+				if (outcome.kind === "cancelled" || outcome.kind === "timed_out") {
 					return controlledFailure(outcome.kind);
 				}
 				if (outcome.kind === "error") throw classifySubagentFailure(outcome.error, "runtime", childToolFailed);
@@ -9759,12 +9722,7 @@ export class NativeSubagentRunner {
 					),
 				);
 				if (observedTurns === turnsBefore) observedTurns += 1;
-				if (finalOutcome.kind === "needs_time") return retainForExtension(runFinalization);
-				if (
-					finalOutcome.kind === "cancelled" ||
-					finalOutcome.kind === "timed_out" ||
-					finalOutcome.kind === "output_truncated"
-				) {
+				if (finalOutcome.kind === "cancelled" || finalOutcome.kind === "timed_out") {
 					return controlledFailure(finalOutcome.kind);
 				}
 				if (finalOutcome.kind === "error") {
@@ -9799,7 +9757,6 @@ export class NativeSubagentRunner {
 						liveControl.waitForPendingSteering(),
 					]) {
 						const reason = await awaitInteractiveBoundary(waitPromise);
-						if (reason === "needs_time") return retainForExtension(() => runAfterInitial(reportStartIndex));
 						if (reason) return controlledFailure(reason);
 					}
 					supervisor?.resumeFromControlledWait();
@@ -9822,37 +9779,6 @@ export class NativeSubagentRunner {
 					? finalizeReport(reportStartIndex)
 					: completeFromPlainFinalTurn(reportStartIndex);
 			};
-			runContinuation = async (): Promise<SubagentResult> => {
-				if (authorityRevoked) {
-					return buildFailureResult(
-						new SubagentError(
-							"capability_denied",
-							"Current parent settings or trust revoked this child before continuation.",
-						),
-					);
-				}
-				supervisor?.setPhase("working");
-				const continuationPrompt = structuredReportMode
-					? SUBAGENT_EXTENSION_PROMPT
-					: SUBAGENT_EXTENSION_PROMPT_PLAIN;
-				const turnsBefore = observedTurns;
-				const reportStartIndex = childSession!.messages.length;
-				const outcome = await awaitPrompt(
-					childSession!.prompt(continuationPrompt, {
-						expandPromptTemplates: false,
-						source: "extension",
-					}),
-				);
-				if (observedTurns === turnsBefore) observedTurns += 1;
-				if (outcome.kind === "needs_time") return retainForExtension(runContinuation);
-				if (outcome.kind === "cancelled" || outcome.kind === "timed_out" || outcome.kind === "output_truncated") {
-					return controlledFailure(outcome.kind);
-				}
-				if (outcome.kind === "error") {
-					throw classifySubagentFailure(outcome.error, "runtime", childToolFailed);
-				}
-				return runAfterInitial(reportStartIndex);
-			};
 			const runInitial = async (): Promise<SubagentResult> => {
 				if (authorityRevoked) {
 					return buildFailureResult(
@@ -9874,8 +9800,7 @@ export class NativeSubagentRunner {
 					}),
 				);
 				if (observedTurns === turnsBefore) observedTurns += 1;
-				if (outcome.kind === "needs_time") return retainForExtension(runContinuation);
-				if (outcome.kind === "cancelled" || outcome.kind === "timed_out" || outcome.kind === "output_truncated") {
+				if (outcome.kind === "cancelled" || outcome.kind === "timed_out") {
 					return controlledFailure(outcome.kind);
 				}
 				if (outcome.kind === "error") {
@@ -9894,9 +9819,7 @@ export class NativeSubagentRunner {
 				message: failure.message,
 				...(retrySafeStartup ? { retryable: true } : {}),
 			};
-			const assistantText = childSession ? observeAssistantText() : "";
-			const reportArtifact = childSession ? spillAssistantOutput(assistantText) : undefined;
-			const spillDiagnostic = childSession ? reportSpillDiagnostic(assistantText, reportArtifact) : undefined;
+			if (childSession) observeAssistantText();
 			const usage = observeUsage();
 			const status = control === "cancelled" ? "cancelled" : control === "timed_out" ? "timed_out" : "failed";
 			if (childSession) {
@@ -9919,9 +9842,7 @@ export class NativeSubagentRunner {
 				childSessionId: childSession?.sessionId,
 				retrySafeStartup,
 				status,
-				summary: childSession
-					? truncateSubagentOutput(assistantText, normalized.maxOutputBytes).text
-					: diagnostic.message,
+				summary: diagnostic.message,
 				observedOutputBytes,
 				partial: status !== "failed",
 				...(childSession
@@ -9935,8 +9856,7 @@ export class NativeSubagentRunner {
 							),
 						}
 					: {}),
-				...(reportArtifact ? { reportArtifact } : {}),
-				diagnostics: [diagnostic, ...(spillDiagnostic ? [spillDiagnostic] : [])],
+				diagnostics: [diagnostic],
 				...(usage ? { usage } : {}),
 			});
 			settledTerminalResult = failedResult;
@@ -9954,8 +9874,8 @@ export class NativeSubagentRunner {
 					options.onManagedResult,
 				);
 			}
-			if (supervisor?.stateValue !== "awaiting_extension") await flushSubagentHookObservations(options.hookRuntime);
-			if (supervisor?.stateValue !== "awaiting_extension") await cleanupTerminalSession();
+			await flushSubagentHookObservations(options.hookRuntime);
+			await cleanupTerminalSession();
 		}
 	}
 }
@@ -9964,8 +9884,6 @@ export type SubagentRecoveryStopReason = "cancelled" | "timed_out" | "fail_fast"
 
 export interface SubagentRecoveryHooks {
 	getStopReason?: () => SubagentRecoveryStopReason | undefined;
-	beforeAttempt?: (attempt: SubagentAttemptNumber, request: NormalizedSubagentRequest) => boolean;
-	afterAttempt?: (attempt: SubagentAttemptNumber, result: SubagentResult) => void;
 }
 
 export async function runSubagentWithRecovery(
@@ -10033,44 +9951,14 @@ export async function runSubagentWithRecovery(
 			const stopReason = hooks.getStopReason?.();
 			if (stopReason) return finalize(stoppedResult(stopReason));
 		}
-		if (hooks.beforeAttempt && !hooks.beforeAttempt(attempt, normalized)) {
-			return finalize({
-				runId: normalized.runId,
-				parentSessionId: normalized.parentSessionId,
-				profile: normalized.profile.name,
-				source: normalized.profile.source,
-				status: "failed",
-				summary: "Retry output budget is unavailable.",
-				observedOutputBytes: 0,
-				partial: false,
-				diagnostics: [
-					{
-						code: "batch_budget_exhausted",
-						message: "Retry output budget is unavailable.",
-					},
-				],
-			});
-		}
-
 		let result: SubagentResult;
 		try {
 			if (attempt === 2) {
 				const remainingTime = deadline - Date.now();
 				if (remainingTime <= 0) return finalize(stoppedResult("timed_out"));
-				const remainingOutput = normalized.maxOutputBytes - totalObservedOutputBytes;
-				if (remainingOutput < 1024)
-					throw new SubagentError(
-						"batch_budget_exhausted",
-						"No bounded output capacity remains for startup recovery.",
-					);
 				currentRequest = {
 					...normalized,
 					timeoutMs: remainingTime,
-					maxOutputBytes: remainingOutput,
-					execution: Object.freeze({
-						...normalized.execution,
-						maxOutputBytes: remainingOutput,
-					}),
 				};
 				if (normalized.resolveStartupFallback)
 					currentRequest.retryModel = normalized.resolveStartupFallback(currentRequest);
@@ -10111,7 +9999,6 @@ export async function runSubagentWithRecovery(
 		attempts.push(attemptSummary);
 		totalObservedOutputBytes += result.observedOutputBytes;
 		totalTurns += result.observedTurns ?? 0;
-		hooks.afterAttempt?.(attempt, result);
 		if (result.usage) {
 			addBatchUsage(aggregate, result.usage);
 			hasUsage = true;
@@ -10163,6 +10050,10 @@ export function createSubagentLaunchProvenance(
 		...(request.selectedAdapterIds ? { adapterIds: [...request.selectedAdapterIds] } : {}),
 		scopeRoots: [...request.scope.roots],
 		scopeTargets: [...(request.scope.targets ?? [])],
+		checkIn: {
+			intervalMs: request.checkInIntervalMs,
+			source: request.iceContract.sources.checkInIntervalMs,
+		},
 		execution: {
 			...request.execution,
 			timeoutMs: request.timeoutMs,
@@ -10170,7 +10061,6 @@ export function createSubagentLaunchProvenance(
 			sources: {
 				thinking: request.iceContract.sources.thinking,
 				timeoutMs: request.iceContract.sources.timeoutMs,
-				maxOutputBytes: request.iceContract.sources.maxOutputBytes,
 				temperature: request.iceContract.sources.temperature,
 				topP: request.iceContract.sources.topP,
 			},
@@ -10191,14 +10081,16 @@ export function createSubagentLaunchProvenance(
 
 interface ResolvedBatchConfiguration {
 	concurrency: number;
-	totalBudgetBytes: number;
 }
 
 function resolveBatchConfiguration(options: SubagentBatchRunOptions): ResolvedBatchConfiguration {
+	if (Object.hasOwn(options, "totalBudgetBytes")) {
+		throw new SubagentError("malformed_result", '"totalBudgetBytes" was removed; output storage is host-owned.');
+	}
 	if (Object.hasOwn(options, "totalTokenBudget")) {
 		throw new SubagentError(
 			"malformed_result",
-			'"totalTokenBudget" was removed; use per-task timeoutMs/maxOutputBytes and batch concurrency.',
+			'"totalTokenBudget" was removed; use batch concurrency and per-task execution controls.',
 		);
 	}
 	const maxAllowed = options.concurrencyPolicy?.maxConcurrency ?? SUBAGENT_BATCH_LIMITS.maxConcurrency;
@@ -10207,18 +10099,7 @@ function resolveBatchConfiguration(options: SubagentBatchRunOptions): ResolvedBa
 	if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > maxAllowed) {
 		throw new SubagentError("malformed_result", `Batch concurrency must be between 1 and ${maxAllowed}.`);
 	}
-	const totalBudgetBytes = options.totalBudgetBytes ?? SUBAGENT_BATCH_LIMITS.defaultBudgetBytes;
-	if (
-		!Number.isInteger(totalBudgetBytes) ||
-		totalBudgetBytes <= 0 ||
-		totalBudgetBytes > SUBAGENT_BATCH_LIMITS.defaultBudgetBytes
-	) {
-		throw new SubagentError("malformed_result", "Batch budget is outside the bounded output budget.");
-	}
-	if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
-		throw new SubagentError("malformed_result", "Batch timeout must be a positive finite number.");
-	}
-	return { concurrency, totalBudgetBytes };
+	return { concurrency };
 }
 
 function preflightModel(task: ResolvedSubagentBatchTask): SubagentLaunchPreflightTask["model"] {
@@ -10255,15 +10136,8 @@ export function buildSubagentLaunchPreflight(
 	options: SubagentBatchRunOptions & { batchId?: string } = {},
 ): SubagentLaunchPreflight {
 	validateResolvedBatchTasks(tasks);
-	const { concurrency, totalBudgetBytes } = resolveBatchConfiguration(options);
-	let reservedOutputBytes = 0;
+	const { concurrency } = resolveBatchConfiguration(options);
 	const preflightTasks = tasks.map((task) => {
-		if (!Number.isInteger(task.request.maxOutputBytes) || task.request.maxOutputBytes <= 0) {
-			throw new SubagentError("malformed_result", `Invalid output reservation for task ${task.id}.`);
-		}
-		if (task.request.maxOutputBytes > totalBudgetBytes) {
-			throw new SubagentError("batch_budget_exhausted", `Batch budget cannot reserve task ${task.id}.`);
-		}
 		revalidateSubagentProfile(task.request.profile);
 		revalidateSubagentResources(task.request.resources);
 		assertSubagentHandoffContextBudget(task.request.contextPacket, task.request.forkContext);
@@ -10279,7 +10153,6 @@ export function buildSubagentLaunchPreflight(
 				`Parent policy does not permit any child tool for task ${task.id}.`,
 			);
 		}
-		reservedOutputBytes += task.request.maxOutputBytes;
 		return {
 			taskId: task.id,
 			role: task.request.role,
@@ -10302,7 +10175,6 @@ export function buildSubagentLaunchPreflight(
 			execution: {
 				thinking: task.request.execution.thinking,
 				timeoutMs: task.request.timeoutMs,
-				maxOutputBytes: task.request.execution.maxOutputBytes,
 				...(task.request.execution.temperature !== undefined
 					? { temperature: task.request.execution.temperature }
 					: {}),
@@ -10366,11 +10238,6 @@ export function buildSubagentLaunchPreflight(
 		batchId: options.batchId,
 		taskCount: tasks.length,
 		concurrency,
-		budget: {
-			totalOutputBytes: totalBudgetBytes,
-			reservedOutputBytes,
-			maxPotentialOutputBytes: reservedOutputBytes * 2,
-		},
 		recovery: options.unsafeHostExec
 			? { maxAttempts: 1, sameModel: true, retryableFailures: [] }
 			: {
@@ -10389,7 +10256,6 @@ export function formatSubagentLaunchDigest(preflight: SubagentLaunchPreflight, m
 	const lines = [
 		`Launch preflight: ${preflight.taskCount} tasks`,
 		`concurrency: ${preflight.concurrency}`,
-		`output budget: ${preflight.budget.reservedOutputBytes}/${preflight.budget.totalOutputBytes} bytes reserved (max potential ${preflight.budget.maxPotentialOutputBytes})`,
 		`recovery: maxAttempts=${preflight.recovery.maxAttempts} sameModel=${preflight.recovery.sameModel} retryable=${preflight.recovery.retryableFailures.join(",")}`,
 		...preflight.tasks.flatMap((task) => {
 			const model = task.model.resolved ?? "unresolved";
@@ -10413,7 +10279,7 @@ export function formatSubagentLaunchDigest(preflight: SubagentLaunchPreflight, m
 					? `  targets: ${task.scopeTargets.map((target) => relative(task.cwd, target) || ".").join(", ")}`
 					: undefined,
 				`  tools: ${task.tools.join(", ")}`,
-				`  execution: thinking=${task.execution.thinking} timeout=${task.execution.timeoutMs}ms output=${task.execution.maxOutputBytes} bytes${task.execution.temperature !== undefined ? ` temperature=${task.execution.temperature}` : ""}${
+				`  execution: thinking=${task.execution.thinking} timeout=${task.execution.timeoutMs}ms${task.execution.temperature !== undefined ? ` temperature=${task.execution.temperature}` : ""}${
 					task.execution.topP !== undefined ? ` topP=${task.execution.topP}` : ""
 				}`,
 				task.outputSchema
@@ -10427,45 +10293,6 @@ export function formatSubagentLaunchDigest(preflight: SubagentLaunchPreflight, m
 		.filter((line): line is string => line !== undefined)
 		.join("\n");
 	return truncateSubagentOutput(redactCredentialText(lines), maxBytes).text;
-}
-
-class SubagentBatchBudgetLedger {
-	private readonly total: number;
-	private reserved = 0;
-	private consumed = 0;
-	private released = 0;
-
-	constructor(total: number) {
-		this.total = total;
-	}
-
-	get remaining(): number {
-		return Math.max(0, this.total - this.reserved - this.consumed);
-	}
-
-	reserve(amount: number): boolean {
-		if (amount > this.remaining) return false;
-		this.reserved += amount;
-		return true;
-	}
-
-	reconcile(reservation: number, actual: number): void {
-		this.reserved -= reservation;
-		const observedActual = Math.max(actual, 0);
-		const chargeableActual = Math.min(observedActual, Math.max(0, this.total - this.consumed));
-		this.consumed += chargeableActual;
-		this.released += Math.max(0, reservation - chargeableActual);
-	}
-
-	snapshot(): SubagentBatchBudget {
-		return {
-			total: this.total,
-			reserved: this.reserved,
-			consumed: this.consumed,
-			remaining: this.remaining,
-			released: this.released,
-		};
-	}
 }
 
 function batchUsage(): SubagentUsage {
@@ -10505,9 +10332,7 @@ function batchTaskResult(
 function batchItem(
 	task: ResolvedSubagentBatchTask,
 	result: SubagentResult,
-	verification = result.status === "needs_time"
-		? pendingSubagentVerification(result)
-		: verifySubagentResult(result, task.request),
+	verification = verifySubagentResult(result, task.request),
 ): SubagentBatchItemResult {
 	const normalizedResult = {
 		...result,
@@ -10540,11 +10365,8 @@ function batchStatus(
 	failFast: boolean,
 ): SubagentBatchStatus {
 	const successful = items.filter((item) => item.result.status === "completed" && item.verification.verified).length;
-	const needsTime = items.filter((item) => item.result.status === "needs_time").length;
 	if (successful === items.length) return "completed";
 	if (successful > 0) return "partial";
-	if (needsTime > 0 && needsTime === items.length) return "needs_time";
-	if (needsTime > 0) return "partial";
 	if (failFast) return "failed";
 	if (stopReason === "timed_out" || items.some((item) => item.result.status === "timed_out")) return "timed_out";
 	if (stopReason === "cancelled" || items.some((item) => item.result.status === "cancelled")) return "cancelled";
@@ -10557,15 +10379,13 @@ export async function runResolvedSubagentBatch(
 	runner: Pick<NativeSubagentRunner, "runResolved">,
 	options: SubagentBatchRunOptions = {},
 ): Promise<SubagentBatchResult> {
-	const batchId = randomUUID();
+	const batchId = options.batchId ?? randomUUID();
 	const preflight = buildSubagentLaunchPreflight(tasks, parentActiveTools, {
 		...options,
 		batchId,
 	});
 	const concurrency = preflight.concurrency;
-	const totalBudgetBytes = preflight.budget.totalOutputBytes;
 	const admission = options.admission;
-	const budget = new SubagentBatchBudgetLedger(totalBudgetBytes);
 	const controller = new AbortController();
 	const items: Array<SubagentBatchItemResult | undefined> = new Array(tasks.length);
 	const diagnostics: SubagentDiagnostic[] = [];
@@ -10574,9 +10394,8 @@ export async function runResolvedSubagentBatch(
 	let active = 0;
 	let settled = 0;
 	let finished = false;
-	let stopReason: "cancelled" | "timed_out" | undefined;
+	let stopReason: "cancelled" | undefined;
 	let failFastTriggered = false;
-	let timeout: NodeJS.Timeout | undefined;
 	let removeAbortListener: (() => void) | undefined;
 
 	return new Promise<SubagentBatchResult>((resolveBatch) => {
@@ -10594,7 +10413,6 @@ export async function runResolvedSubagentBatch(
 		const finish = (): void => {
 			if (finished || settled !== tasks.length || active !== 0) return;
 			finished = true;
-			if (timeout) clearTimeout(timeout);
 			removeAbortListener?.();
 			removeAdmissionListener?.();
 			const completedItems = items as SubagentBatchItemResult[];
@@ -10604,7 +10422,6 @@ export async function runResolvedSubagentBatch(
 				preflight,
 				items: completedItems,
 				usage,
-				budget: budget.snapshot(),
 				diagnostics,
 			});
 		};
@@ -10657,13 +10474,6 @@ export async function runResolvedSubagentBatch(
 			while (active < concurrency && nextIndex < tasks.length) {
 				if (admission && !admission.tryAcquire()) break;
 				const task = tasks[nextIndex]!;
-				const reservation = task.request.maxOutputBytes;
-				if (!budget.reserve(reservation)) {
-					admission?.release();
-					if (active > 0) break;
-					markQueued(nextIndex++, "failed", "batch_budget_exhausted", "Batch budget cannot reserve this task.");
-					continue;
-				}
 				const index = nextIndex++;
 				active++;
 				publishTaskState({
@@ -10673,6 +10483,7 @@ export async function runResolvedSubagentBatch(
 					role: task.request.profile.name,
 					index,
 				});
+				let childResult: SubagentResult | undefined;
 				void Promise.resolve()
 					.then(() => {
 						const runAttempt = (
@@ -10690,9 +10501,13 @@ export async function runResolvedSubagentBatch(
 								signal: controller.signal,
 								isAuthorityStillValid: () => options.isAuthorityStillValid?.(request, task.hookRuntime) ?? true,
 								batchId,
-								management: "internal",
+								...(options.managedBackground ? {} : { management: "internal" as const }),
+								noLifetimeTimeout: true,
 								attempt,
 								hookRuntime: task.hookRuntime,
+								onManagedHandle: options.managedBackground
+									? (handle) => options.onManagedHandle?.(task, handle)
+									: undefined,
 								onEvent: (event) => options.onEvent?.({ ...event, taskId: task.id }),
 							});
 						return options.unsafeHostExec
@@ -10702,18 +10517,11 @@ export async function runResolvedSubagentBatch(
 										if (stopReason) return stopReason;
 										return failFastTriggered ? "fail_fast" : undefined;
 									},
-									beforeAttempt: (attempt) => attempt === 1 || budget.reserve(reservation),
-									afterAttempt: (_attempt, result) =>
-										budget.reconcile(reservation, result.observedOutputBytes),
 								});
 					})
 					.then(
 						(result) => {
-							if (options.unsafeHostExec) budget.reconcile(reservation, result.observedOutputBytes);
-							const verification =
-								result.status === "needs_time"
-									? pendingSubagentVerification(result)
-									: verifySubagentResult(result, task.request);
+							const verification = verifySubagentResult(result, task.request);
 							const finalResult =
 								!verification.verified && result.status === "completed"
 									? {
@@ -10728,22 +10536,19 @@ export async function runResolvedSubagentBatch(
 											],
 										}
 									: result;
+							childResult = finalResult;
 							const item = batchItem(task, finalResult, verification);
 							items[index] = item;
 							addBatchUsage(usage, item.result.usage);
-							if (
-								options.failFast &&
-								item.result.status !== "needs_time" &&
-								(item.result.status !== "completed" || !item.verification.verified)
-							) {
+							if (options.failFast && (item.result.status !== "completed" || !item.verification.verified)) {
 								failFastTriggered = true;
 								controller.abort();
 							}
 						},
 						(error: unknown) => {
-							if (options.unsafeHostExec) budget.reconcile(reservation, 0);
 							const failure = classifySubagentFailure(error, "runtime");
 							const result = batchTaskResult(task, "failed", failure.code, failure.message, failure.retryable);
+							childResult = result;
 							items[index] = batchItem(task, result);
 							diagnostics.push({ code: result.diagnostics[0]!.code, message: `${task.id}: ${failure.message}` });
 							addBatchUsage(usage, result.usage);
@@ -10754,6 +10559,11 @@ export async function runResolvedSubagentBatch(
 						},
 					)
 					.finally(() => {
+						try {
+							options.onChildTerminal?.(task, childResult);
+						} catch {
+							// Lifecycle observers cannot change batch results.
+						}
 						active--;
 						admission?.release();
 						settled++;
@@ -10763,7 +10573,7 @@ export async function runResolvedSubagentBatch(
 			finish();
 		};
 
-		const stop = (reason: "cancelled" | "timed_out"): void => {
+		const stop = (reason: "cancelled"): void => {
 			if (stopReason || finished || failFastTriggered) return;
 			stopReason = reason;
 			controller.abort();
@@ -10777,7 +10587,6 @@ export async function runResolvedSubagentBatch(
 				removeAbortListener = () => options.signal?.removeEventListener("abort", abortListener);
 			}
 		}
-		if (options.timeoutMs !== undefined) timeout = setTimeout(() => stop("timed_out"), options.timeoutMs);
 		pump();
 	});
 }
@@ -10853,7 +10662,7 @@ export function resolveReviewTask(
 			context: task.context,
 			contextPacket: task.contextPacket,
 			contextMode: task.contextMode,
-			timeoutMs: task.timeoutMs,
+			checkInIntervalMs: task.checkInIntervalMs,
 			execution: task.execution,
 			resources: task.resources,
 			outputSchema: task.outputSchema,
@@ -10942,26 +10751,20 @@ export async function runResolvedReviewBatch(
 		};
 	});
 	const successful = reviewers.filter(reviewBatchItemStatus).length;
-	const needsTime = reviewers.filter((reviewer) => reviewer.result.status === "needs_time").length;
 	const status: SubagentBatchStatus =
 		successful === reviewers.length
 			? "completed"
 			: successful > 0
 				? "partial"
-				: needsTime === reviewers.length
-					? "needs_time"
-					: needsTime > 0
-						? "partial"
-						: batch.status === "timed_out" || batch.status === "cancelled"
-							? batch.status
-							: "failed";
+				: batch.status === "timed_out" || batch.status === "cancelled"
+					? batch.status
+					: "failed";
 	return {
 		batchId: batch.batchId,
 		status,
 		preflight: batch.preflight,
 		reviewers,
 		usage: batch.usage,
-		budget: batch.budget,
 		diagnostics: batch.diagnostics,
 	};
 }
@@ -11129,7 +10932,6 @@ const subagentExecutionParameters = Type.Object(
 			]),
 		),
 		tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 32 }), { maxItems: 7 })),
-		maxOutputBytes: Type.Optional(Type.Integer({ minimum: 1024, maximum: 65536 })),
 		temperature: Type.Optional(
 			Type.Number({
 				minimum: SUBAGENT_EXECUTION_LIMITS.minTemperature,
@@ -11143,7 +10945,7 @@ const subagentExecutionParameters = Type.Object(
 	{
 		additionalProperties: false,
 		description:
-			"Per-call execution request. Thinking never changes the model route; tools narrow profile capabilities; output and timeout limits are enforced by the runtime, never by prompt text.",
+			"Per-call execution request. Thinking never changes the model route; tools narrow profile capabilities; final-answer retention is controlled separately by fixed host limits.",
 	},
 );
 
@@ -11168,7 +10970,14 @@ const delegateParameters = Type.Object(
 		context: Type.Optional(Type.String({ maxLength: 8 * 1024 })),
 		contextPacket: Type.Optional(contextPacketParameters),
 		contextMode: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")])),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 * 60 * 1000 })),
+		checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
+		startupTimeoutMs: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				maximum: 10 * 60 * 1000,
+				description: "Bounds child startup only, not its lifetime.",
+			}),
+		),
 		execution: Type.Optional(subagentExecutionParameters),
 		resources: Type.Optional(resourceSelectionParameters),
 		acceptanceCriteria: Type.Optional(acceptanceCriteriaParameters),
@@ -11180,23 +10989,6 @@ const delegateParameters = Type.Object(
 
 const delegateAsyncParameters = delegateParameters;
 
-/**
- * The foreground `delegate` tool accepts one extra control-plane option: a
- * managed launch that returns a retained handle at admission. The durable async
- * job surface keeps its own acceptance contract and does not expose it.
- */
-const delegateForegroundParameters = Type.Object(
-	{
-		...delegateParameters.properties,
-		background: Type.Optional(
-			Type.Boolean({
-				description:
-					"Return a retained managed handle as soon as the child is admitted instead of blocking until it finishes. The same run ID, child session, model, profile, scope, and tool authority continue; manage the run with manage_subagent.",
-			}),
-		),
-	},
-	{ additionalProperties: false },
-);
 const listSubagentProfilesParameters = Type.Object({
 	query: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
@@ -11210,6 +11002,21 @@ const subagentJobParameters = Type.Object({
 	}),
 });
 
+const readSubagentOutputParameters = Type.Object(
+	{
+		artifactId: Type.String({
+			minLength: 36,
+			maxLength: 36,
+			pattern: "^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$",
+			description:
+				"Opaque artifact ID from a SubagentOutput.artifact reference. Do not pass a runId, jobId, resultRef, or path.",
+		}),
+		offset: Type.Optional(Type.Integer({ minimum: 0 })),
+		length: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_OUTPUT_ARTIFACT_LIMITS.maxReadBytes })),
+	},
+	{ additionalProperties: false },
+);
+
 const manageSubagentParameters = Type.Object(
 	{
 		runId: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
@@ -11217,14 +11024,12 @@ const manageSubagentParameters = Type.Object(
 			Type.Literal("inspect"),
 			Type.Literal("peek"),
 			Type.Literal("wait"),
-			Type.Literal("extend"),
 			Type.Literal("follow_up"),
 			Type.Literal("stop"),
 			Type.Literal("detach"),
 			Type.Literal("resume"),
 			Type.Literal("delete"),
 		]),
-		additionalMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: SUBAGENT_PROFILE_LIMITS.maxTimeoutMs })),
 		requestId: Type.Optional(
 			Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
 		),
@@ -11237,12 +11042,11 @@ const manageSubagentParameters = Type.Object(
 					"Bounded management wait window. Expiry reports the current state with waitExpired; it never marks the child timed_out.",
 			}),
 		),
-		wait: Type.Optional(Type.Boolean()),
 	},
 	{
 		additionalProperties: false,
 		description:
-			"Inspect, peek, wait, extend, follow up, detach, stop, resume, or delete the same ICE subagent through one phase-aware lifecycle. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately; wait blocks the parent tool call for at most waitMs until a terminal or attention state. Detach retains the same live child under management so the parent can continue other work; it never spends the extension reserve. Follow-up requires a stable requestId and is rejected while a user has takeover control. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently. Managed terminal observations outlive reusable sessions for peek/wait. Resume is valid only for retained completed children; delete is owner-scoped and idempotent.",
+			"Inspect, peek, wait, follow up, stop, detach, resume, or delete the same ICE subagent through one owner-scoped lifecycle. Newly launched children run without a lifetime deadline and are supervised by advisory parent check-ins; elapsed time or stale progress never terminates them. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately; wait blocks the parent tool call for at most waitMs and reports waitExpired without changing child state. Follow-up requires a stable requestId and is rejected while a user has takeover control. Stop explicitly cancels a running child. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently. Managed terminal observations outlive reusable sessions for peek/wait. Resume is valid only for retained completed children; delete is owner-scoped and idempotent.",
 	},
 );
 
@@ -11268,15 +11072,18 @@ const writerPatchWorkflowParameters = Type.Object({
 	artifact: writerPatchArtifactParameters,
 });
 
-const delegateWriteParameters = Type.Object({
-	task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
-	baseCommit: Type.String({ pattern: "^[0-9a-f]{40}$", minLength: 40, maxLength: 40 }),
-	scope: Type.Object({
-		roots: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 16 }),
-	}),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: WRITER_MAX_TIMEOUT_MS })),
-	maxOutputBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: WRITER_MAX_OUTPUT_BYTES })),
-});
+const delegateWriteParameters = Type.Object(
+	{
+		task: Type.String({ minLength: 1, maxLength: 16 * 1024 }),
+		baseCommit: Type.String({ pattern: "^[0-9a-f]{40}$", minLength: 40, maxLength: 40 }),
+		scope: Type.Object({
+			roots: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 16 }),
+		}),
+		checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
+		startupTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: WRITER_MAX_TIMEOUT_MS })),
+	},
+	{ additionalProperties: false },
+);
 
 const delegateBatchTaskParameters = Type.Object(
 	{
@@ -11288,7 +11095,7 @@ const delegateBatchTaskParameters = Type.Object(
 		context: Type.Optional(Type.String({ maxLength: 8 * 1024 })),
 		contextPacket: Type.Optional(contextPacketParameters),
 		contextMode: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")])),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 * 60 * 1000 })),
+		checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
 		execution: Type.Optional(subagentExecutionParameters),
 		resources: Type.Optional(resourceSelectionParameters),
 		acceptanceCriteria: Type.Optional(acceptanceCriteriaParameters),
@@ -11298,13 +11105,14 @@ const delegateBatchTaskParameters = Type.Object(
 	{ additionalProperties: false },
 );
 
-const delegateBatchParameters = Type.Object({
-	tasks: Type.Array(delegateBatchTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
-	concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
-	totalBudgetBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.defaultBudgetBytes })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 * 60 * 1000 })),
-	failFast: Type.Optional(Type.Boolean()),
-});
+const delegateBatchParameters = Type.Object(
+	{
+		tasks: Type.Array(delegateBatchTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
+		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
+		failFast: Type.Optional(Type.Boolean()),
+	},
+	{ additionalProperties: false },
+);
 
 const evidenceRefParameters = Type.Object({
 	path: Type.String({ minLength: 1, maxLength: 4096 }),
@@ -11325,7 +11133,7 @@ const reviewTaskParameters = Type.Object(
 		context: Type.Optional(Type.String({ maxLength: 8 * 1024 })),
 		contextPacket: Type.Optional(contextPacketParameters),
 		contextMode: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")])),
-		timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 * 60 * 1000 })),
+		checkInIntervalMs: Type.Optional(Type.Integer({ minimum: SUBAGENT_CHECKIN_INTERVAL_MS })),
 		execution: Type.Optional(subagentExecutionParameters),
 		resources: Type.Optional(resourceSelectionParameters),
 		outputSchema: Type.Optional(Type.Record(Type.String({ minLength: 1, maxLength: 64 }), Type.Unknown())),
@@ -11333,17 +11141,30 @@ const reviewTaskParameters = Type.Object(
 	{ additionalProperties: false },
 );
 
-const reviewBatchParameters = Type.Object({
-	tasks: Type.Array(reviewTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
-	concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
-	totalBudgetBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.defaultBudgetBytes })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 * 60 * 1000 })),
-	failFast: Type.Optional(Type.Boolean()),
+const reviewBatchParameters = Type.Object(
+	{
+		tasks: Type.Array(reviewTaskParameters, { minItems: 1, maxItems: SUBAGENT_BATCH_LIMITS.maxTasks }),
+		concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: SUBAGENT_BATCH_LIMITS.maxConcurrency })),
+		failFast: Type.Optional(Type.Boolean()),
+	},
+	{ additionalProperties: false },
+);
+
+const subagentBatchIdParameters = Type.Object({
+	batchId: Type.String({
+		minLength: 1,
+		maxLength: 128,
+		pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+		description: "Bare owner-scoped batchId returned by delegate_batch or review_batch.",
+	}),
 });
 
 type DelegateWriteTool = ToolDefinition<
 	typeof delegateWriteParameters,
-	{ result: WriterResult; progress?: SubagentProgressSnapshot } | undefined
+	| { accepted: { runId: string; resultRef: string; baseCommit: string; workspaceIsolation: "worktree" | "parent" } }
+	| { result: WriterResult; progress?: SubagentProgressSnapshot }
+	| SubagentToolErrorDetails
+	| undefined
 >;
 type WriterPatchWorkflowTool = ToolDefinition<
 	typeof writerPatchWorkflowParameters,
@@ -11362,7 +11183,7 @@ type DelegateToolResult =
 			launch: SubagentLaunchProvenance;
 	  }
 	| SubagentToolErrorDetails;
-type DelegateTool = ToolDefinition<typeof delegateForegroundParameters, DelegateToolResult | undefined>;
+type DelegateTool = ToolDefinition<typeof delegateParameters, DelegateToolResult | undefined>;
 
 type DelegateAsyncTool = ToolDefinition<
 	typeof delegateAsyncParameters,
@@ -11382,15 +11203,20 @@ type ListSubagentProfilesTool = ToolDefinition<
 	SubagentProfileListingDetails | undefined
 >;
 type SubagentJobTool = ToolDefinition<typeof subagentJobParameters, { inspection: SubagentJobInspection } | undefined>;
+type ReadSubagentOutputTool = ToolDefinition<
+	typeof readSubagentOutputParameters,
+	{ output: SubagentOutputRead } | { error: { code: SubagentOutputArtifactErrorCode; message: string } } | undefined
+>;
 type ManageSubagentTool = ToolDefinition<
 	typeof manageSubagentParameters,
 	| {
-			action: "inspect" | "peek" | "wait" | "extend" | "follow_up" | "stop" | "detach" | "resume" | "delete";
+			action: "inspect" | "peek" | "wait" | "follow_up" | "stop" | "detach" | "resume" | "delete";
 			resumedFromRunId?: string;
 			deleted?: { runId: string; deleted: boolean };
 			runId: string;
 			attention?: SubagentRuntimeAttention;
 			observation?: SubagentManagedObservation;
+			writer?: ManagedWriterInspection;
 			result?: SubagentResult;
 			followUp?: { runId: string; status: "queued" | "duplicate" };
 	  }
@@ -11398,13 +11224,43 @@ type ManageSubagentTool = ToolDefinition<
 	| undefined
 >;
 
+type ManagedBatchAccepted = {
+	accepted: {
+		batchId: string;
+		resultRef: string;
+		tasks: Array<{ taskId: string; runId: string; role: string; model: string }>;
+	};
+	progress?: SubagentProgressSnapshot;
+};
+type ManagedBatchInspection = {
+	batchId: string;
+	kind: "batch" | "review";
+	state: ManagedSubagentBatchRecord["state"];
+	acceptedAt: number;
+	tasks: ManagedBatchTaskState[];
+	result?: SubagentBatchResult | ReviewBatchResult;
+};
 type DelegateBatchTool = ToolDefinition<
 	typeof delegateBatchParameters,
-	{ result: SubagentBatchResult; progress?: SubagentProgressSnapshot } | SubagentToolErrorDetails | undefined
+	| ManagedBatchAccepted
+	| { result: SubagentBatchResult; progress?: SubagentProgressSnapshot }
+	| SubagentToolErrorDetails
+	| undefined
 >;
 type ReviewBatchTool = ToolDefinition<
 	typeof reviewBatchParameters,
-	{ result: ReviewBatchResult; progress?: SubagentProgressSnapshot } | SubagentToolErrorDetails | undefined
+	| ManagedBatchAccepted
+	| { result: ReviewBatchResult; progress?: SubagentProgressSnapshot }
+	| SubagentToolErrorDetails
+	| undefined
+>;
+type InspectSubagentBatchTool = ToolDefinition<
+	typeof subagentBatchIdParameters,
+	{ inspection: ManagedBatchInspection } | SubagentToolErrorDetails | undefined
+>;
+type CancelSubagentBatchTool = ToolDefinition<
+	typeof subagentBatchIdParameters,
+	{ inspection: ManagedBatchInspection } | SubagentToolErrorDetails | undefined
 >;
 
 const BREADTH_CRITERIA_THRESHOLD = 6;
@@ -11481,37 +11337,25 @@ function formatWriterToolResult(result: WriterResult): string {
 	return truncateSubagentOutput(redactCredentialText(text), 16 * 1024).text;
 }
 
-function pendingSubagentVerification(result: SubagentResult): SubagentVerification {
-	return {
-		verified: false,
-		reason:
-			result.status === "needs_time"
-				? "Verification is pending because the same live child is awaiting an extension or stop decision."
-				: "Verification has not completed.",
-		paths: [],
-		unresolvedClaims: [],
-	};
+function subagentCheckInFreshness(
+	progressAgeMs: number | undefined,
+	intervalMs: number,
+): "fresh" | "stale" | "unknown" {
+	if (progressAgeMs === undefined) return "unknown";
+	return progressAgeMs <= intervalMs ? "fresh" : "stale";
 }
 
 function formatRuntimeAttention(attention: SubagentRuntimeAttention): string {
 	const activities = attention.lastActivities.slice(-3);
-	const suggestedMs = Math.min(attention.remainingExtendableMs, attention.phase === "finalization" ? 30_000 : 60_000);
 	return [
-		`Runtime attention: ${attention.phase} · ${attention.activeElapsedMs}/${attention.activeBudgetMs} ms used (initial ${attention.initialTimeoutMs} ms, ${attention.extensionCount} extension${attention.extensionCount === 1 ? "" : "s"}, +${attention.totalExtendedMs} ms).`,
-		`Remaining extendable time: ${attention.remainingExtendableMs} ms.${suggestedMs >= 1_000 ? ` Suggested extension: ${suggestedMs} ms.` : ""}`,
-		attention.remainingRetentionMs !== undefined
-			? `Remaining detach retention: ${attention.remainingRetentionMs} ms (separate from the extension reserve).`
-			: undefined,
+		`Background child is running · ${attention.phase} · ${attention.activeElapsedMs} ms active; there is no lifetime timeout.`,
 		attention.progressAgeMs !== undefined ? `Last progress: ${attention.progressAgeMs} ms ago.` : undefined,
 		attention.repeatedFailure
-			? `Advisory: the same action failed ${attention.repeatedFailure.count} times recently ("${attention.repeatedFailure.action}"); inspect before extending.`
+			? `Advisory: the same action failed ${attention.repeatedFailure.count} times recently ("${attention.repeatedFailure.action}"); inspect before following up.`
 			: undefined,
 		activities.length > 0
 			? `Last ${activities.length} tool activit${activities.length === 1 ? "y" : "ies"}:\n${activities.map((activity) => `- ${formatSubagentToolActivity(activity)}`).join("\n")}`
 			: "Last tool activities: none observed.",
-		attention.decisionDeadlineAtMs !== undefined
-			? `Decision deadline: ${new Date(attention.decisionDeadlineAtMs).toISOString()}.`
-			: undefined,
 	]
 		.filter((part): part is string => part !== undefined)
 		.join("\n");
@@ -11521,8 +11365,49 @@ function formatRuntimeAttention(attention: SubagentRuntimeAttention): string {
  * Render a bounded management observation. `waitExpired` describes only the
  * parent management window and is never presented as a child timeout.
  */
-function formatManagedObservation(observation: SubagentManagedObservation): string {
+function formatSubagentCheckInState(state: SubagentCheckInState | undefined): string | undefined {
+	if (!state) return undefined;
+	const nextDue = state.nextDueAt === undefined ? undefined : new Date(state.nextDueAt).toISOString();
+	return [
+		`Parent check-in: ${state.delivery} (sequence ${state.sequence}).`,
+		nextDue ? `Next check-in due: ${nextDue}.` : undefined,
+		state.pendingSince !== undefined
+			? `Parent review pending since: ${new Date(state.pendingSince).toISOString()}.`
+			: undefined,
+		state.lastAcknowledgedAt !== undefined
+			? `Last parent review acknowledged: ${new Date(state.lastAcknowledgedAt).toISOString()}.`
+			: undefined,
+	]
+		.filter((part): part is string => part !== undefined)
+		.join(" ");
+}
+
+/** Parent-facing, pathless description of where the complete final answer lives. */
+export function formatSubagentOutputReference(output: SubagentOutput | undefined): string | undefined {
+	if (!output || output.captureStatus === "inline_complete") return undefined;
+	if (output.captureStatus === "artifact_unavailable" || !output.artifact) {
+		return `Final answer (${output.originalBytes} bytes) exceeded the inline limit and could not be retained; only the inline prefix is available.`;
+	}
+	const artifact = output.artifact;
+	return `Complete final answer retained as output artifact ${artifact.id} (${artifact.storedBytes} of ${artifact.originalBytes} bytes stored${artifact.truncated ? ", truncated at the host storage limit" : ""}). Read it with read_subagent_output using artifactId ${artifact.id}.`;
+}
+
+function formatManagedObservation(
+	observation: SubagentManagedObservation,
+	verification?: SubagentVerification,
+): string {
+	if (observation.result && verification) {
+		const header = [`Subagent ${observation.runId} is ${observation.childState}.`];
+		const checkIn = formatSubagentCheckInState(observation.checkIn);
+		if (checkIn) header.push(checkIn);
+		return truncateSubagentOutput(
+			redactCredentialText([...header, formatToolResult(observation.result, verification)].join("\n")),
+			16 * 1024,
+		).text;
+	}
 	const lines = [`Subagent ${observation.runId} is ${observation.childState}.`];
+	const checkIn = formatSubagentCheckInState(observation.checkIn);
+	if (checkIn) lines.push(checkIn);
 	if (observation.waitExpired) {
 		lines.push(
 			"Management wait expired while the child was still running; the child did not time out and remains retained.",
@@ -11533,12 +11418,16 @@ function formatManagedObservation(observation: SubagentManagedObservation): stri
 			`Terminal result: ${observation.result.status} · ${observation.result.summary}`,
 			...(observation.result.partial ? ["The result is partial; treat it as unverified evidence."] : []),
 		);
+		const outputReference = formatSubagentOutputReference(observation.result.output);
+		if (outputReference) lines.push(outputReference);
 	}
 	if (observation.attention) {
 		lines.push(formatRuntimeAttention(observation.attention));
 		if (!observation.terminal) {
 			lines.push(
-				`Use manage_subagent with runId ${observation.runId} to peek, wait, extend, detach, or stop the same retained child.`,
+				observation.attention.lifetimeDeadline === false
+					? `Use manage_subagent with runId ${observation.runId} to inspect, peek, wait, follow up, or stop the same running child.`
+					: `Use manage_subagent with runId ${observation.runId} to inspect, peek, wait, follow up, or stop the same retained child.`,
 			);
 		}
 	}
@@ -11578,18 +11467,14 @@ function formatToolResult(result: SubagentResult, verification: SubagentVerifica
 		`Subagent ${result.status} (${result.profile}, ${result.runId}).`,
 		result.summary,
 		modeRow,
-		result.status === "needs_time"
-			? "Parent verification: pending; the retained child is not terminal."
-			: verification.verified
-				? verification.kind === "plain_bounds"
-					? "Parent verification: plain answer accepted (lineage and output bound only; no structured verification)."
-					: "Parent verification: passed."
-				: `Parent verification: failed. ${verification.reason}`,
+		verification.verified
+			? verification.kind === "plain_bounds"
+				? "Parent verification: plain answer accepted (lineage and output bound only; no structured verification)."
+				: "Parent verification: passed."
+			: `Parent verification: failed. ${verification.reason}`,
 		...(requirementRows.length > 0 ? [requirementRows.join("\n")] : []),
 		...(artifactRows.length > 0 ? [artifactRows.join("\n")] : []),
-		result.reportArtifact
-			? `Oversized report capture: ${result.reportArtifact.path} (${result.reportArtifact.originalBytes} bytes${result.reportArtifact.truncated ? ", artifact truncated" : ""}).`
-			: undefined,
+		formatSubagentOutputReference(result.output),
 		result.attention ? formatRuntimeAttention(result.attention) : undefined,
 		verification.unresolvedClaims.length > 0
 			? `Unresolved claims for parent synthesis: ${verification.unresolvedClaims.join(" | ")}`
@@ -11609,20 +11494,12 @@ function formatSubagentJobInspection(inspection: SubagentJobInspection): string 
 			inspection.tombstone
 				? `Expired from full retention; final status ${inspection.tombstone.terminalStatus}. Full result artifacts are no longer retained.`
 				: undefined,
-			inspection.job.status === "needs_time" && inspection.job.runId
-				? `The same child run is retained as ${inspection.job.runId}; inspect/extend/stop it instead of launching a duplicate.`
-				: undefined,
 			inspection.queuePosition !== undefined ? `Queue position: ${inspection.queuePosition}.` : undefined,
-			inspection.budget?.ownerActiveJobs !== undefined &&
-			inspection.budget.ownerQueuedJobs !== undefined &&
-			inspection.budget.ownerActiveJobsCap !== undefined
-				? `Admission: active=${inspection.budget.ownerActiveJobs}, queued=${inspection.budget.ownerQueuedJobs}, cap=${inspection.budget.ownerActiveJobsCap}.`
-				: undefined,
-			inspection.budget
-				? `Output reservation: ${inspection.budget.reservedOutputBytes}/${inspection.budget.ownerBudgetBytes} bytes.`
+			inspection.scheduling
+				? `Admission: active=${inspection.scheduling.ownerActiveJobs}, queued=${inspection.scheduling.ownerQueuedJobs}, cap=${inspection.scheduling.ownerActiveJobsCap}.`
 				: undefined,
 			inspection.job.contract
-				? `Accepted contract: thinking=${inspection.job.contract.thinking}, timeout=${inspection.job.contract.timeoutMs}ms, output=${inspection.job.contract.maxOutputBytes} bytes, tools=${inspection.job.contract.tools.join(",") || "none"}.`
+				? `Accepted contract: thinking=${inspection.job.contract.thinking}, ${inspection.job.contract.timeoutMs === undefined ? "no child lifetime deadline" : `legacy timeout=${inspection.job.contract.timeoutMs}ms`}, check-in=${inspection.job.contract.checkInIntervalMs === undefined ? "legacy interval unavailable" : `${inspection.job.contract.checkInIntervalMs}ms`}${inspection.job.contract.maxOutputBytes !== undefined ? ", legacy output cap ignored" : ""}, tools=${inspection.job.contract.tools.join(",") || "none"}.`
 				: undefined,
 			`Result ref: ${inspection.job.resultRef}.`,
 			result?.summary,
@@ -11662,7 +11539,6 @@ function formatBatchToolResult(result: SubagentBatchResult): string {
 	const text = [
 		formatSubagentLaunchDigest(result.preflight),
 		`Subagent batch ${result.status} (${result.batchId}).`,
-		`Budget: ${result.budget.consumed}/${result.budget.total} output bytes consumed; ${result.budget.released} released.`,
 		...result.items.map(
 			(item) =>
 				`Task ${item.taskId}: ${item.result.status}; verification ${item.verification.verified ? "passed" : "failed"}.\n${item.result.summary}`,
@@ -11676,7 +11552,6 @@ function formatReviewBatchToolResult(result: ReviewBatchResult): string {
 	const text = [
 		formatSubagentLaunchDigest(result.preflight),
 		`Reviewer batch ${result.status} (${result.batchId}).`,
-		`Budget: ${result.budget.consumed}/${result.budget.total} output bytes consumed; ${result.budget.released} released.`,
 		...result.reviewers.map((reviewer) => {
 			const findings = reviewer.findings.map(
 				(finding) =>
@@ -12771,7 +12646,10 @@ export function formatIceSubagentSettingsSummary(settingsManager: SettingsManage
 			`concurrency: default=${concurrencyPolicy.defaultConcurrency} [${concurrencyPolicy.sources.default}] · cap=${concurrencyPolicy.maxConcurrency} [${concurrencyPolicy.sources.max}] · shared batch/job admission (limits ${SUBAGENT_CONCURRENCY_LIMITS.min}-${SUBAGENT_CONCURRENCY_LIMITS.hardCap})${concurrencyPolicy.diagnostics.length > 0 ? ` · ${concurrencyPolicy.diagnostics.join("; ")}` : ""}`,
 		);
 		lines.push(
-			`budgets: hard maximum ${ICE_SUBAGENT_SETTINGS_LIMITS.maxTimeoutMs} ms per child · management wait default ${SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS} ms (max ${SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS} ms) · detach retention ${SUBAGENT_DETACH_RETENTION_MS} ms (separate from the extension reserve); a wait expiry is not a child timeout`,
+			`startup bound: maximum ${ICE_SUBAGENT_SETTINGS_LIMITS.maxStartupTimeoutMs} ms to create/admit a child · management wait default ${SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS} ms (max ${SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS} ms) · detach retention ${SUBAGENT_DETACH_RETENTION_MS} ms; none of these is a child lifetime timeout`,
+		);
+		lines.push(
+			`check-ins: default ${global.subagents.defaults.checkInIntervalMs ?? SUBAGENT_CHECKIN_INTERVAL_MS} ms · minimum ${ICE_SUBAGENT_SETTINGS_LIMITS.minCheckInIntervalMs} ms · managed runs have no lifetime deadline`,
 		);
 		lines.push("");
 		for (const role of contractRoles.slice(0, 12)) {
@@ -12784,8 +12662,8 @@ export function formatIceSubagentSettingsSummary(settingsManager: SettingsManage
 			});
 			const values = [
 				`thinking=${contract.values.thinking} [${contract.sources.thinking}]`,
-				`timeout=${contract.values.timeoutMs}ms [${contract.sources.timeoutMs}]`,
-				`output=${contract.values.maxOutputBytes} [${contract.sources.maxOutputBytes}]`,
+				`startupTimeout=${contract.values.timeoutMs}ms [${contract.sources.timeoutMs}]`,
+				`checkIn=${contract.values.checkInIntervalMs}ms [${contract.sources.checkInIntervalMs}]`,
 				...(contract.values.temperature !== undefined
 					? [`temperature=${contract.values.temperature} [${contract.sources.temperature}]`]
 					: []),
@@ -12843,8 +12721,8 @@ function applyIceProfileSettingsSummary(
 			role: profile.name,
 			bundledDefaults: {
 				thinking: profile.effectiveThinkingLevel,
-				timeoutMs: profile.effectiveTimeoutMs,
-				maxOutputBytes: profile.effectiveMaxOutputBytes,
+				checkInIntervalMs: profile.effectiveCheckInIntervalMs ?? SUBAGENT_CHECKIN_INTERVAL_MS,
+				startupTimeoutMs: profile.effectiveTimeoutMs,
 				temperature: profile.requestedTemperature,
 				topP: profile.requestedTopP,
 			},
@@ -12857,8 +12735,8 @@ function applyIceProfileSettingsSummary(
 		return {
 			...profile,
 			effectiveThinkingLevel: contract.values.thinking,
+			effectiveCheckInIntervalMs: contract.values.checkInIntervalMs,
 			effectiveTimeoutMs: contract.values.timeoutMs,
-			effectiveMaxOutputBytes: contract.values.maxOutputBytes,
 			...(contract.values.temperature !== undefined ? { effectiveTemperature: contract.values.temperature } : {}),
 			...(contract.values.topP !== undefined ? { effectiveTopP: contract.values.topP } : {}),
 			effectiveSettingSources: Object.freeze({ ...contract.sources }),
@@ -12899,17 +12777,10 @@ function isCurrentSubagentAuthorityValid(
 			call: {
 				role: normalized.role,
 				thinking: normalized.execution.thinking,
-				timeoutMs: normalized.timeoutMs,
-				maxOutputBytes: normalized.execution.maxOutputBytes,
+				startupTimeoutMs: normalized.timeoutMs,
 			},
 		});
-		if (
-			contract.denied ||
-			!contract.enabled ||
-			contract.values.timeoutMs < normalized.timeoutMs ||
-			contract.values.maxOutputBytes < normalized.execution.maxOutputBytes
-		)
-			return false;
+		if (contract.denied || !contract.enabled || contract.values.timeoutMs < normalized.timeoutMs) return false;
 		const acceptedTools = (normalized.execution.tools ?? normalized.profile.requestedTools).filter(
 			(tool) => !normalized.deniedTools.includes(tool.toLowerCase()),
 		);
@@ -13152,6 +13023,9 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const subYoloEnabled = (): boolean => flagEnabled(ice, "sub-yolo");
 	const agentDir = options.agentDir ?? getAgentDir();
 	const subagentArtifactRoot = join(agentDir, "artifacts", "subagent");
+	const outputArtifacts = new SubagentOutputArtifactStore({
+		artifactRoot: join(agentDir, "artifacts", "subagent-output"),
+	});
 	const registeredMcpProxy: IceSubagentMcpAdapter = {
 		getIdentity: () => parentMcpAdapters.get(ice.events),
 		listAuthorizedTools: () => parentMcpAdapters.get(ice.events)?.listAuthorizedTools() ?? [],
@@ -13193,17 +13067,320 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	});
 	const liveSessions = new SubagentLiveSessionRegistry();
 	const supervisorRegistry = new SubagentRunSupervisorRegistry<SubagentResult>();
+	let observatoryStore: SubagentObservatoryStore | undefined;
+	let jobs: SubagentJobRegistry | undefined;
+	const checkIns = new Map<string, SubagentCheckInCoordinator>();
+	const getCheckIns = (ownerSessionId: string): SubagentCheckInCoordinator => {
+		let coordinator = checkIns.get(ownerSessionId);
+		if (!coordinator) {
+			coordinator = new SubagentCheckInCoordinator(
+				ownerSessionId,
+				() => options.agentViewBridge?.getParentSession(),
+				undefined,
+				(runId, state) => {
+					liveSessions.updateCheckInState(runId, state);
+					observatoryStore?.updateCheckInState(runId, state);
+					jobs?.updateCheckInState(
+						runId,
+						state
+							? {
+									sequence: state.sequence,
+									...(state.lastAcknowledgedAt !== undefined
+										? { lastAcknowledgedAt: state.lastAcknowledgedAt }
+										: {}),
+									...(state.pendingSince !== undefined ? { pendingSince: state.pendingSince } : {}),
+									...(state.delivery === "owner_unavailable" && state.pendingSince !== undefined
+										? { overdueSince: state.pendingSince }
+										: {}),
+								}
+							: undefined,
+					);
+				},
+			);
+			checkIns.set(ownerSessionId, coordinator);
+		}
+		return coordinator;
+	};
+	const terminalCheckIn = (ownerSessionId: string, runId: string): void => {
+		const coordinator = checkIns.get(ownerSessionId);
+		if (!coordinator) return;
+		coordinator.terminal(runId);
+		if (coordinator.activeChildrenCount === 0) {
+			coordinator.dispose();
+			checkIns.delete(ownerSessionId);
+		}
+	};
+	const withCheckIn = <T extends { runId: string }>(
+		observation: T,
+		ownerSessionId: string,
+	): T & {
+		checkIn?: SubagentCheckInState;
+	} => {
+		const checkIn = checkIns.get(ownerSessionId)?.getState(observation.runId);
+		return checkIn ? { ...observation, checkIn } : observation;
+	};
+	// Accepted requests of managed delegate runs so terminal observations get the same parent
+	// verification the synchronous path produced. Bounded; oldest entries are dropped first.
+	const managedRequests = new Map<string, NormalizedSubagentRequest>();
+	const managedRequestKey = (ownerSessionId: string, runId: string): string => `${ownerSessionId}\u0000${runId}`;
+	const rememberManagedRequest = (request: NormalizedSubagentRequest): void => {
+		const key = managedRequestKey(request.parentSessionId, request.runId);
+		managedRequests.delete(key);
+		managedRequests.set(key, request);
+		while (managedRequests.size > SUBAGENT_MANAGED_REQUEST_LIMIT) {
+			const oldest = managedRequests.keys().next().value;
+			if (oldest === undefined) break;
+			managedRequests.delete(oldest);
+		}
+	};
+	const managedVerificationFor = (
+		ownerSessionId: string,
+		observation: SubagentManagedObservation,
+	): SubagentVerification | undefined => {
+		if (!observation.result) return undefined;
+		const request = managedRequests.get(managedRequestKey(ownerSessionId, observation.result.runId));
+		return request ? verifySubagentResult(observation.result, request) : undefined;
+	};
+	const managedBatches = new Map<string, ManagedSubagentBatchRecord>();
+	const managedBatchOutputReference = (batchId: string): string => `batch:${batchId}`;
+	const releaseManagedBatchOutput = (record: ManagedSubagentBatchRecord): void => {
+		for (const artifactId of record.outputArtifactIds) {
+			outputArtifacts.release({
+				ownerSessionId: record.ownerSessionId,
+				artifactId,
+				referenceId: managedBatchOutputReference(record.batchId),
+			});
+		}
+		record.outputArtifactIds.clear();
+	};
+	const pruneManagedBatches = (): void => {
+		while (managedBatches.size >= SUBAGENT_BATCH_LIMITS.retainedManagedBatches) {
+			const oldestTerminal = [...managedBatches.entries()].find(([, record]) =>
+				["completed", "partial", "failed", "cancelled"].includes(record.state),
+			);
+			if (!oldestTerminal) return;
+			releaseManagedBatchOutput(oldestTerminal[1]);
+			managedBatches.delete(oldestTerminal[0]);
+		}
+	};
+	const createManagedBatch = (
+		batchId: string,
+		ownerSessionId: string,
+		kind: ManagedSubagentBatchRecord["kind"],
+		controller: AbortController,
+		tasks: readonly ResolvedSubagentBatchTask[],
+	): ManagedSubagentBatchRecord => {
+		const active = [...managedBatches.values()].filter(
+			(record) => !["completed", "partial", "failed", "cancelled"].includes(record.state),
+		).length;
+		if (active >= SUBAGENT_BATCH_LIMITS.maxManagedBatches) {
+			throw new SubagentError("batch_budget_exhausted", "The owner reached the active managed-batch limit.");
+		}
+		pruneManagedBatches();
+		if (managedBatches.size >= SUBAGENT_BATCH_LIMITS.retainedManagedBatches) {
+			throw new SubagentError("batch_budget_exhausted", "The managed-batch result ledger is full.");
+		}
+		const record: ManagedSubagentBatchRecord = {
+			batchId,
+			ownerSessionId,
+			kind,
+			acceptedAt: Date.now(),
+			tasks: new Map(
+				tasks.map((task) => [
+					task.id,
+					{
+						taskId: task.id,
+						runId: task.request.runId,
+						role: task.request.role,
+						model: modelLabel(task.model) ?? "unknown",
+						status: "queued",
+					},
+				]),
+			),
+			controller,
+			outputArtifactIds: new Set(),
+			state: "queued",
+		};
+		managedBatches.set(batchId, record);
+		return record;
+	};
+	const snapshotManagedBatch = (record: ManagedSubagentBatchRecord): ManagedBatchInspection => ({
+		batchId: record.batchId,
+		kind: record.kind,
+		state: record.state,
+		acceptedAt: record.acceptedAt,
+		tasks: [...record.tasks.values()].map((task) => ({
+			...task,
+			...(checkIns.get(record.ownerSessionId)?.getState(task.runId)
+				? { checkIn: checkIns.get(record.ownerSessionId)?.getState(task.runId) }
+				: {}),
+		})),
+		...(record.result ? { result: record.result } : {}),
+	});
+	const ownedManagedBatch = (batchId: string, ownerSessionId: string): ManagedSubagentBatchRecord => {
+		const record = managedBatches.get(batchId);
+		if (!record || record.ownerSessionId !== ownerSessionId) {
+			throw new SubagentError("capability_denied", "The managed batch is not available to this owner session.");
+		}
+		return record;
+	};
+	const managedWriters = new Map<string, ManagedWriterRecord>();
+	const releaseManagedWriterOutput = (record: ManagedWriterRecord): void => {
+		const artifactId = record.result?.output?.artifact?.id;
+		if (!artifactId) return;
+		outputArtifacts.release({ ownerSessionId: record.ownerSessionId, artifactId });
+	};
+	const managedWriterControllers = new Set<AbortController>();
+	const managedWriterTasks = new Set<Promise<WriterResult>>();
+	let pendingManagedWriterAdmissions = 0;
+	const pruneManagedWriters = (): void => {
+		while (managedWriters.size >= MANAGED_WRITER_LIMITS.retained) {
+			const oldestTerminal = [...managedWriters.entries()].find(
+				([, record]) => record.state !== "starting" && record.state !== "running",
+			);
+			if (!oldestTerminal) return;
+			releaseManagedWriterOutput(oldestTerminal[1]);
+			managedWriters.delete(oldestTerminal[0]);
+		}
+	};
+	const reserveManagedWriterAdmission = (): void => {
+		const active = [...managedWriters.values()].filter(
+			(record) => record.state === "starting" || record.state === "running",
+		).length;
+		if (active + pendingManagedWriterAdmissions >= MANAGED_WRITER_LIMITS.maxActive) {
+			throw new SubagentError("batch_budget_exhausted", "The owner reached the active managed-writer limit.");
+		}
+		pruneManagedWriters();
+		if (managedWriters.size >= MANAGED_WRITER_LIMITS.retained) {
+			throw new SubagentError("batch_budget_exhausted", "The managed-writer result ledger is full.");
+		}
+		pendingManagedWriterAdmissions++;
+	};
+	const releaseManagedWriterAdmission = (): void => {
+		pendingManagedWriterAdmissions = Math.max(0, pendingManagedWriterAdmissions - 1);
+	};
+	const snapshotManagedWriter = (record: ManagedWriterRecord, waitExpired = false): ManagedWriterInspection => ({
+		runId: record.runId,
+		state: record.state,
+		...(waitExpired ? { waitExpired: true } : {}),
+		acceptedAt: record.acceptedAt,
+		baseCommit: record.baseCommit,
+		workspaceIsolation: record.workspaceIsolation,
+		phase: record.phase,
+		...(record.currentTool ? { currentTool: record.currentTool } : {}),
+		...(record.currentPath ? { currentPath: record.currentPath } : {}),
+		...(record.lastProgressAt !== undefined ? { lastProgressAt: record.lastProgressAt } : {}),
+		...(checkIns.get(record.ownerSessionId)?.getState(record.runId)
+			? { checkIn: checkIns.get(record.ownerSessionId)?.getState(record.runId) }
+			: {}),
+		...(record.result ? { result: redactWriterResult(record.result) } : {}),
+	});
+	const ownedManagedWriter = (runId: string, ownerSessionId: string): ManagedWriterRecord | undefined => {
+		const record = managedWriters.get(runId);
+		if (record && record.ownerSessionId !== ownerSessionId) {
+			throw new SubagentError("capability_denied", "The managed writer is not available to this owner session.");
+		}
+		return record;
+	};
+	const waitManagedWriter = async (
+		record: ManagedWriterRecord,
+		waitMs: number,
+		signal: AbortSignal | undefined,
+	): Promise<boolean> => {
+		if (record.state !== "starting" && record.state !== "running") return false;
+		if (!Number.isSafeInteger(waitMs) || waitMs < 1 || waitMs > SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS) {
+			throw new SubagentError(
+				"malformed_result",
+				`Management wait must be an integer between 1 and ${SUBAGENT_MANAGEMENT_WAIT_LIMIT_MS} ms.`,
+			);
+		}
+		return await new Promise<boolean>((resolve) => {
+			let settled = false;
+			const finish = (expired: boolean): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", abortWait);
+				resolve(expired);
+			};
+			const abortWait = (): void => finish(true);
+			const timer = setTimeout(() => finish(true), waitMs);
+			if (signal?.aborted) finish(true);
+			else signal?.addEventListener("abort", abortWait, { once: true });
+			void record.completion?.then(
+				() => finish(false),
+				() => finish(false),
+			);
+		});
+	};
+	const armManagedWriterCheckIn = (record: ManagedWriterRecord, intervalMs: number, model: string): void => {
+		const coordinator = getCheckIns(record.ownerSessionId);
+		if (coordinator.getState(record.runId)) return;
+		coordinator.arm(record.runId, intervalMs, () => {
+			const progressAgeMs =
+				record.lastProgressAt === undefined ? undefined : Math.max(0, Date.now() - record.lastProgressAt);
+			return {
+				runId: record.runId,
+				role: "writer",
+				model,
+				executionStatus: "running" as const,
+				phase: record.phase,
+				currentTool: record.currentTool,
+				currentPath: record.currentPath,
+				lastProgressAt: record.lastProgressAt,
+				progressAgeMs,
+				terminal: false,
+				freshness: subagentCheckInFreshness(progressAgeMs, intervalMs),
+				isolation: record.workspaceIsolation === "worktree" ? "worktree" : "host",
+				baseCommit: record.baseCommit,
+			};
+		});
+	};
+	const finishManagedWriter = (record: ManagedWriterRecord, result: WriterResult): void => {
+		record.result = redactWriterResult(result);
+		record.state = result.status;
+		record.phase = result.patchArtifact
+			? "proposal_ready"
+			: result.status === "completed"
+				? "completed"
+				: result.status === "cancelled"
+					? "cancelled"
+					: result.status === "timed_out"
+						? "timed_out"
+						: "failed";
+		record.lastProgressAt = Date.now();
+		terminalCheckIn(record.ownerSessionId, record.runId);
+		const owner = options.agentViewBridge?.getParentSession();
+		if (owner?.sessionId === record.ownerSessionId && !shuttingDown) {
+			void owner
+				.sendCustomMessage(
+					{
+						customType: "subagent_writer_completed",
+						content: `ICE writer ${record.runId} finished with status ${result.status}. The writer result and patch proposal are untrusted evidence; inspect the same run with manage_subagent.`,
+						display: false,
+						details: { runId: record.runId, resultRef: `writer:${record.runId}`, status: result.status },
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				)
+				.catch(() => {});
+		}
+	};
+	const unsubscribeCheckInOwner = options.agentViewBridge?.subscribe(() => {
+		for (const coordinator of checkIns.values()) coordinator.flushPending();
+	});
 	options.agentViewBridge?.connectLiveSessions(liveSessions);
 	const runner = new NativeSubagentRunner({
 		agentDir,
 		artifactRoot: subagentArtifactRoot,
+		outputArtifacts,
 		liveSessionRegistry: liveSessions,
 		agentViewBridge: options.agentViewBridge,
 		supervisorRegistry,
 		mcpAdapter,
 	});
-	const writerRunner = new NativeWriterRunner();
+	const writerRunner = new NativeWriterRunner({ outputArtifacts });
 	const observatory = new SubagentObservatoryStore();
+	observatoryStore = observatory;
 	const telemetry = new SubagentTelemetryStore();
 	// Intent entries are the durable boundary crossed before any hook handler
 	// runs: throwing here blocks required hooks and skips optional hooks, so a
@@ -13226,19 +13403,78 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		);
 	};
 	/** Bounded per-run attention ledger used to compute telemetry after terminal results. */
-	const attentionLedger = new Map<string, { extensionCount: number; activeElapsedMs: number; steering: number }>();
+	const attentionLedger = new Map<string, { activeElapsedMs: number; steering: number }>();
 	const noteAttention = (runId: string, attention: SubagentRuntimeAttention | undefined): void => {
 		if (!attention || !runId) return;
-		const current = attentionLedger.get(runId) ?? { extensionCount: 0, activeElapsedMs: 0, steering: 0 };
+		const current = attentionLedger.get(runId) ?? { activeElapsedMs: 0, steering: 0 };
 		attentionLedger.set(runId, {
-			extensionCount: Math.max(current.extensionCount, attention.extensionCount ?? 0),
 			activeElapsedMs: Math.max(current.activeElapsedMs, attention.activeElapsedMs ?? 0),
 			steering: current.steering,
 		});
 	};
 	const noteSteering = (runId: string): void => {
-		const current = attentionLedger.get(runId) ?? { extensionCount: 0, activeElapsedMs: 0, steering: 0 };
+		const current = attentionLedger.get(runId) ?? { activeElapsedMs: 0, steering: 0 };
 		attentionLedger.set(runId, { ...current, steering: current.steering + 1 });
+	};
+	const armManagedBatchChild = (
+		record: ManagedSubagentBatchRecord,
+		task: ResolvedSubagentBatchTask,
+		handle: SubagentManagedHandle,
+		unsafeHostExec: boolean,
+	): void => {
+		const state = record.tasks.get(task.id);
+		if (state) state.status = "running";
+		record.state = "running";
+		const coordinator = getCheckIns(task.request.parentSessionId);
+		if (coordinator.getState(handle.runId)) return;
+		coordinator.arm(handle.runId, task.request.checkInIntervalMs, () => {
+			const attention = runner.getRuntimeAttention(handle.runId, task.request.parentSessionId);
+			const lastActivity = attention?.lastActivities.at(-1);
+			return {
+				runId: handle.runId,
+				role: task.request.role,
+				model: modelLabel(task.model) ?? "unknown",
+				executionStatus: "running" as const,
+				phase: attention?.phase,
+				currentTool: lastActivity?.toolName,
+				currentPath: lastActivity?.path,
+				lastProgressAt: attention?.lastProgressAtMs,
+				progressAgeMs: attention?.progressAgeMs,
+				recentActivities: attention?.lastActivities.slice(-3).map(formatSubagentToolActivity),
+				terminal: attention?.state === "terminal",
+				freshness: subagentCheckInFreshness(attention?.progressAgeMs, task.request.checkInIntervalMs),
+				isolation: unsafeHostExec ? ("host" as const) : ("read-only" as const),
+			};
+		});
+	};
+	const noteManagedBatchChildTerminal = (
+		record: ManagedSubagentBatchRecord,
+		task: ResolvedSubagentBatchTask,
+		result: SubagentResult | undefined,
+	): void => {
+		terminalCheckIn(task.request.parentSessionId, task.request.runId);
+		const artifactId = result?.output?.artifact?.id;
+		if (
+			artifactId &&
+			outputArtifacts.retain({
+				ownerSessionId: record.ownerSessionId,
+				artifactId,
+				referenceId: managedBatchOutputReference(record.batchId),
+			})
+		) {
+			record.outputArtifactIds.add(artifactId);
+		}
+		const state = record.tasks.get(task.id);
+		if (state) {
+			state.status =
+				result?.status === "completed" || result?.status === "verification_failed"
+					? "completed"
+					: result?.status === "cancelled"
+						? "cancelled"
+						: result?.status === "timed_out"
+							? "timed_out"
+							: "failed";
+		}
 	};
 	const recordTelemetry = (
 		runId: string,
@@ -13248,14 +13484,13 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		verification: SubagentVerification,
 		requiredCriteriaTotal: number,
 	): void => {
-		if (result.status === "needs_time") return; // Nonterminal runs are recorded after extension resolution.
 		const attention = attentionLedger.get(runId);
 		telemetry.record({
 			runId,
 			profile,
 			mode,
 			attempts: result.recovery?.attemptCount ?? 1,
-			extensionCount: attention?.extensionCount ?? 0,
+			extensionCount: 0,
 			activeElapsedMs: attention?.activeElapsedMs ?? 0,
 			finalStatus: result.status,
 			reportProtocolStatus:
@@ -13269,7 +13504,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		});
 		attentionLedger.delete(runId);
 	};
-	let jobs: SubagentJobRegistry | undefined;
 	let subagentAdmission: SubagentConcurrencyAdmission | undefined;
 	let parentBusy = false;
 	let shuttingDown = false;
@@ -13354,7 +13588,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		label: "delegate_write",
 		executionMode: "sequential",
 		description:
-			"Run one foreground ICE writer. Normal mode uses a clean detached Git worktree and returns an immutable bounded patch proposal. Explicit --sub-yolo uses the trusted parent workspace directly, including dirty files, and may use Bash; it provides no isolation, rollback, or patch proposal. The child always uses the current parent model.",
+			"Run one managed ICE writer and return its handle after clean parent/worktree preflight; inspect or stop it with manage_subagent. Normal mode uses a clean detached Git worktree and returns an immutable bounded patch proposal. Explicit --sub-yolo uses the trusted parent workspace directly, including dirty files, and may use Bash; it provides no isolation, rollback, or patch proposal. The child always uses the current parent model.",
 		promptSnippet: "Delegate one bounded writer (isolated normally, direct in YOLO)",
 		parameters: delegateWriteParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("delegate_write", args, theme, context),
@@ -13369,6 +13603,9 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 			);
 			let normalizedRequest: NormalizedWriterRequest | undefined;
 			let directWorkspace = false;
+			let admissionReserved = false;
+			let writerController: AbortController | undefined;
+			let removeWriterAbortListener: (() => void) | undefined;
 			try {
 				const unsafeAuthorization = authorizeUnsafeSubagentHostExecution(ctx, options, subYoloEnabled());
 				directWorkspace = unsafeAuthorization !== undefined;
@@ -13378,15 +13615,38 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					scope: params.scope,
 					baseCommit: params.baseCommit,
 					cwd: ctx.cwd,
-					timeoutMs: params.timeoutMs,
-					maxOutputBytes: params.maxOutputBytes,
+					timeoutMs: params.startupTimeoutMs,
 				};
 				const normalized = normalizeWriterRequest(request, ctx.cwd, {
 					allowExternal: unsafeAuthorization?.allowExternal === true,
 				});
 				normalizedRequest = normalized;
 				const model = requireParentModel(ctx);
-				const result = await writerRunner.run(
+				const checkInIntervalMs = params.checkInIntervalMs ?? SUBAGENT_CHECKIN_INTERVAL_MS;
+				if (!Number.isSafeInteger(checkInIntervalMs) || checkInIntervalMs < SUBAGENT_CHECKIN_INTERVAL_MS) {
+					throw new SubagentError(
+						"malformed_result",
+						`checkInIntervalMs must be an integer of at least ${SUBAGENT_CHECKIN_INTERVAL_MS} ms.`,
+					);
+				}
+				reserveManagedWriterAdmission();
+				admissionReserved = true;
+				const controller = new AbortController();
+				writerController = controller;
+				managedWriterControllers.add(controller);
+				const abortWriter = (): void => controller.abort();
+				if (signal) {
+					if (signal.aborted) abortWriter();
+					else signal.addEventListener("abort", abortWriter, { once: true });
+				}
+				removeWriterAbortListener = signal ? () => signal.removeEventListener("abort", abortWriter) : undefined;
+				let resolveAdmitted: ((record: ManagedWriterRecord) => void) | undefined;
+				const admitted = new Promise<ManagedWriterRecord>((resolve) => {
+					resolveAdmitted = resolve;
+				});
+				let managedRecord: ManagedWriterRecord | undefined;
+				let trackedRun: Promise<WriterResult> | undefined;
+				const rawRun = writerRunner.run(
 					normalized,
 					directWorkspace ? parentToolSnapshot(unsafeAuthorization) : ice.getActiveTools(),
 					{
@@ -13394,29 +13654,123 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						modelRuntime: ctx.modelRegistry.getRuntime(),
 						directWorkspace,
 						unsafeHostExec: directWorkspace,
-						signal,
-						onEvent: (event) =>
-							publishWorkflowProgress(
-								observatory,
-								toolCallId,
-								"delegate_write",
-								{
-									runId: event.runId,
-									model: modelLabel(model),
-									phase: event.phase,
-									status: event.status,
-									cwd: ctx.cwd,
-									currentTool: event.currentTool,
-									currentPath: event.currentPath,
-									artifactReady: event.artifactReady,
-									changedFileCount: event.changedFileCount,
-									artifactStatus: event.artifactStatus,
-									diagnostics: event.diagnostics,
-								},
-								onUpdate,
-							),
+						signal: controller.signal,
+						onAdmitted: (admission) => {
+							if (admissionReserved) {
+								releaseManagedWriterAdmission();
+								admissionReserved = false;
+							}
+							managedRecord = {
+								runId: admission.runId,
+								ownerSessionId: request.parentSessionId,
+								state: "starting",
+								acceptedAt: Date.now(),
+								baseCommit: admission.baseCommit,
+								workspaceIsolation: admission.workspaceIsolation,
+								phase: "workspace_created",
+								controller,
+							};
+							managedWriters.set(managedRecord.runId, managedRecord);
+							if (trackedRun) managedRecord.completion = trackedRun;
+							resolveAdmitted?.(managedRecord);
+						},
+						onEvent: (event) => {
+							try {
+								if (managedRecord) {
+									managedRecord.phase = event.phase;
+									managedRecord.currentTool = event.currentTool;
+									managedRecord.currentPath = event.currentPath;
+									managedRecord.lastProgressAt = Date.now();
+									if (event.phase === "running") {
+										managedRecord.state = "running";
+										armManagedWriterCheckIn(managedRecord, checkInIntervalMs, modelLabel(model) ?? "unknown");
+									}
+								}
+								publishWorkflowProgress(
+									observatory,
+									toolCallId,
+									"delegate_write",
+									{
+										runId: event.runId,
+										model: modelLabel(model),
+										phase: event.phase,
+										status: event.status,
+										cwd: ctx.cwd,
+										currentTool: event.currentTool,
+										currentPath: event.currentPath,
+										artifactReady: event.artifactReady,
+										changedFileCount: event.changedFileCount,
+										artifactStatus: event.artifactStatus,
+										diagnostics: event.diagnostics,
+									},
+									onUpdate,
+								);
+							} catch {
+								// Progress observers cannot change writer execution.
+							}
+						},
 					},
 				);
+				const completion = rawRun.then(
+					(result) => {
+						if (managedRecord) finishManagedWriter(managedRecord, result);
+						return result;
+					},
+					(error: unknown) => {
+						const message = redactCredentialText(error instanceof Error ? error.message : String(error));
+						const failedResult = redactWriterResult({
+							runId: managedRecord?.runId ?? randomUUID(),
+							parentSessionId: request.parentSessionId,
+							status: "failed",
+							workspaceIsolation: directWorkspace ? "parent" : "worktree",
+							summary: message,
+							baseCommit: normalized.baseCommit,
+							observedOutputBytes: 0,
+							workspaceRemoved: !directWorkspace,
+							diagnostics: [{ code: "child_runtime_failure", message }],
+						});
+						if (managedRecord) finishManagedWriter(managedRecord, failedResult);
+						return failedResult;
+					},
+				);
+				trackedRun = completion;
+				if (managedRecord) managedRecord.completion = completion;
+				managedWriterTasks.add(completion);
+				void completion.finally(() => {
+					removeWriterAbortListener?.();
+					removeWriterAbortListener = undefined;
+					if (writerController) managedWriterControllers.delete(writerController);
+					managedWriterTasks.delete(completion);
+					if (admissionReserved) {
+						releaseManagedWriterAdmission();
+						admissionReserved = false;
+					}
+				});
+				// A writer that finishes before admission (preflight failure) returns its result directly.
+				const outcome = await Promise.race([
+					admitted.then((record) => ({ kind: "admitted" as const, record })),
+					completion.then((completed) => ({ kind: "completed" as const, result: completed })),
+				]);
+				if (outcome.kind === "admitted") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Writer ${outcome.record.runId} accepted after clean parent/worktree preflight. It is still running in ${outcome.record.workspaceIsolation === "worktree" ? "an isolated worktree" : "the explicitly authorized parent workspace"}; inspect or stop it with manage_subagent. No patch is integrated automatically.`,
+							},
+						],
+						details: {
+							accepted: {
+								runId: outcome.record.runId,
+								resultRef: `writer:${outcome.record.runId}`,
+								baseCommit: outcome.record.baseCommit,
+								workspaceIsolation: outcome.record.workspaceIsolation,
+							},
+						},
+						isError: false,
+					};
+				}
+				const result = outcome.result;
 				const safeResult = redactWriterResult(result);
 				const progress = publishWorkflowProgress(
 					observatory,
@@ -13450,6 +13804,9 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					isError: safeResult.status !== "completed" || (!directWorkspace && !safeResult.workspaceRemoved),
 				};
 			} catch (error) {
+				removeWriterAbortListener?.();
+				if (writerController) managedWriterControllers.delete(writerController);
+				if (admissionReserved) releaseManagedWriterAdmission();
 				const message = error instanceof Error ? error.message : String(error);
 				const code = error instanceof SubagentError ? error.code : "child_startup_failure";
 				const failedResult = redactWriterResult({
@@ -13944,14 +14301,54 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		name: "manage_subagent",
 		label: "manage_subagent",
 		description:
-			"Inspect, peek, wait for, extend, follow up, detach, stop, resume, or delete the same ICE child through one phase-aware lifecycle. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately. Wait blocks this tool call for at most waitMs until a terminal or attention state; a wait expiry reports the current state and never marks the child timed_out. Detach retains the same live child under management so the parent can continue other work. Follow-up queues bounded untrusted task data through Ice steering, requires a stable requestId, and is rejected while a user has takeover control. Extend preserves run ID, child session, model, profile, scope, tool authority, and output budget. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently, while managed terminal observations stay peekable.",
-		promptSnippet: "Peek, wait for, resume, delete, or manage a retained subagent timeout",
+			"Inspect, peek, wait, follow up, detach, stop, resume, or delete the same ICE child through one phase-aware owner-scoped lifecycle. Use the foreground runId returned by delegate: details.managed.runId for a live background launch, or details.result.runId for a retained terminal result. Do not pass a durable jobId, resultRef such as job:<id>, batchId, or taskId. Peek returns the latest bounded snapshot immediately. Wait blocks this tool call for at most waitMs until a terminal state; a wait expiry reports the current state and never changes child state. Detach retains the same live child under management so the parent can continue other work. Follow-up queues bounded untrusted task data through Ice steering, requires a stable requestId, and is rejected while a user has takeover control. Following up or detaching preserves run ID, model, profile, scope, and tool authority. Stop explicitly cancels a live child. Resume continues a retained completed child in its original session and authority; delete forgets a retained reusable session idempotently, while managed terminal observations stay peekable.",
+		promptSnippet: "Inspect, wait, follow up, stop, or manage a subagent run",
 		parameters: manageSubagentParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("manage_subagent", args, theme, context),
 		renderResult: (result, options, theme, context) => renderObservatoryResult(result, options, theme, context),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const parentSessionId = ctx.sessionManager.getSessionId();
 			try {
+				const writer = ownedManagedWriter(params.runId, parentSessionId);
+				if (writer) {
+					let waitExpired = false;
+					if (params.action === "stop") {
+						if (writer.state !== "starting" && writer.state !== "running") {
+							throw new SubagentError("child_protocol_failure", "The selected writer is not running.");
+						}
+						writer.controller.abort();
+						await writer.completion?.catch(() => undefined);
+					} else if (params.action === "wait") {
+						waitExpired = await waitManagedWriter(
+							writer,
+							params.waitMs ?? SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS,
+							_signal,
+						);
+					} else if (params.action !== "inspect" && params.action !== "peek") {
+						throw new SubagentError(
+							"child_protocol_failure",
+							"Writer handles support inspect, peek, bounded wait, and explicit stop; they cannot be resumed, detached, or followed up.",
+						);
+					}
+					const inspection = snapshotManagedWriter(writer, waitExpired);
+					const text = [
+						`Writer ${inspection.runId} is ${inspection.state}.`,
+						`Isolation: ${inspection.workspaceIsolation}; base commit: ${inspection.baseCommit}.`,
+						`Phase: ${inspection.phase}.`,
+						formatSubagentCheckInState(inspection.checkIn),
+						inspection.currentTool ? `Current tool: ${inspection.currentTool}.` : undefined,
+						inspection.currentPath ? `Current scoped path: ${inspection.currentPath}.` : undefined,
+						inspection.waitExpired ? "Management wait expired; the writer remains active." : undefined,
+						inspection.result ? formatWriterToolResult(inspection.result) : undefined,
+					]
+						.filter((line): line is string => line !== undefined)
+						.join("\n");
+					return {
+						content: [{ type: "text", text: truncateSubagentOutput(redactCredentialText(text), 16 * 1024).text }],
+						details: { action: params.action, runId: params.runId, writer: inspection },
+						isError: false,
+					};
+				}
 				if (params.action === "peek") {
 					const observation = runner.peekRuntime(params.runId, parentSessionId);
 					if (!observation)
@@ -13959,9 +14356,16 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							"child_protocol_failure",
 							"The selected subagent is not a live retained run owned by this parent session.",
 						);
+					const observed = withCheckIn(observation, parentSessionId);
+					const verification = managedVerificationFor(parentSessionId, observed);
 					return {
-						content: [{ type: "text", text: formatManagedObservation(observation) }],
-						details: { action: "peek" as const, runId: params.runId, observation },
+						content: [{ type: "text", text: formatManagedObservation(observed, verification) }],
+						details: {
+							action: "peek" as const,
+							runId: params.runId,
+							observation: observed,
+							...(verification ? { verification } : {}),
+						},
 						isError: false,
 					};
 				}
@@ -13972,9 +14376,16 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						params.waitMs ?? SUBAGENT_MANAGEMENT_WAIT_DEFAULT_MS,
 						_signal,
 					);
+					const observed = withCheckIn(observation, parentSessionId);
+					const verification = managedVerificationFor(parentSessionId, observed);
 					return {
-						content: [{ type: "text", text: formatManagedObservation(observation) }],
-						details: { action: "wait" as const, runId: params.runId, observation },
+						content: [{ type: "text", text: formatManagedObservation(observed, verification) }],
+						details: {
+							action: "wait" as const,
+							runId: params.runId,
+							observation: observed,
+							...(verification ? { verification } : {}),
+						},
 						isError: false,
 					};
 				}
@@ -13985,14 +14396,15 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							"child_protocol_failure",
 							"The selected subagent is not a live retained run that can be detached.",
 						);
+					const observed = withCheckIn(observation, parentSessionId);
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Detached retained subagent ${params.runId}; it keeps the same run ID, child session, model, scope, and tool authority, and it does not spend the extension reserve.\n${formatManagedObservation(observation)}`,
+								text: `Detached retained subagent ${params.runId}; it keeps the same run ID, child session, model, scope, and tool authority.\n${formatManagedObservation(observed)}`,
 							},
 						],
-						details: { action: "detach" as const, runId: params.runId, observation },
+						details: { action: "detach" as const, runId: params.runId, observation: observed },
 						isError: false,
 					};
 				}
@@ -14003,9 +14415,22 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							"child_protocol_failure",
 							"The selected subagent is not a live retained run owned by this parent session.",
 						);
+					const checkIn = checkIns.get(parentSessionId)?.getState(params.runId);
 					return {
-						content: [{ type: "text", text: formatRuntimeAttention(attention) }],
-						details: { action: "inspect" as const, runId: params.runId, attention },
+						content: [
+							{
+								type: "text",
+								text: [formatRuntimeAttention(attention), formatSubagentCheckInState(checkIn)]
+									.filter((part): part is string => part !== undefined)
+									.join("\n"),
+							},
+						],
+						details: {
+							action: "inspect" as const,
+							runId: params.runId,
+							attention,
+							...(checkIn ? { checkIn } : {}),
+						},
 						isError: false,
 					};
 				}
@@ -14034,60 +14459,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						],
 						details: { action: "follow_up" as const, runId: params.runId, followUp },
 						isError: false,
-					};
-				}
-				if (params.action === "extend") {
-					const before = runner.getRuntimeAttention(params.runId, parentSessionId);
-					if (!before || before.state !== "awaiting_extension") {
-						throw new SubagentError(
-							"child_protocol_failure",
-							"The selected subagent is not awaiting an extension.",
-						);
-					}
-					const preferred = before.phase === "finalization" ? 30_000 : 60_000;
-					const additionalMs = params.additionalMs ?? Math.min(preferred, before.remainingExtendableMs);
-					if (additionalMs < 1_000)
-						throw new SubagentError(
-							"child_protocol_failure",
-							"The selected subagent has no extension budget remaining.",
-						);
-					const continuation = runner.extendRuntime(params.runId, parentSessionId, additionalMs);
-					if (params.wait === false) {
-						void continuation.catch(() => {});
-						const attention = runner.getRuntimeAttention(params.runId, parentSessionId);
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Extended retained subagent ${params.runId} by ${additionalMs} ms.${attention ? `\n${formatRuntimeAttention(attention)}` : ""}`,
-								},
-							],
-							details: { action: "extend" as const, runId: params.runId, ...(attention ? { attention } : {}) },
-							isError: false,
-						};
-					}
-					const result = await continuation;
-					const attention =
-						result.status === "needs_time"
-							? runner.getRuntimeAttention(params.runId, parentSessionId)
-							: undefined;
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									result.status === "needs_time" && attention
-										? `Subagent needs more time after extension.\n${formatRuntimeAttention(attention)}`
-										: `Subagent ${result.status} after extension.\n${result.summary}`,
-							},
-						],
-						details: {
-							action: "extend" as const,
-							runId: params.runId,
-							result: redactSubagentResult(result),
-							...(attention ? { attention } : {}),
-						},
-						isError: result.status !== "completed" && result.status !== "needs_time",
 					};
 				}
 				if (params.action === "resume") {
@@ -14131,7 +14502,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							resumedFromRunId: params.runId,
 							result: redactSubagentResult(resumed),
 						},
-						isError: resumed.status !== "completed" && resumed.status !== "needs_time",
+						isError: resumed.status !== "completed",
 					};
 				}
 				if (params.action === "delete") {
@@ -14187,10 +14558,10 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const delegate: DelegateTool = {
 		name: "delegate",
 		label: "delegate",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Run one foreground ICE child as a file agent or self-delegation (role self with bounded parent instructions; no file needed). If the result status is needs_time, the SAME child session is retained; use manage_subagent to inspect, extend, or stop it instead of launching a duplicate replacement. Set background: true to receive a retained managed handle as soon as the child is admitted: the same child session keeps running and is managed with manage_subagent, so a long child never blocks the parent tool call. File agents resolve global-first; models follow the deterministic call/primary/fallback/parent order without credential expansion. Safe mode clamps the selected profile to its requested read-only capabilities. Explicit --sub-yolo permits only the selected profile's requested built-in capabilities that are also active in the trusted parent after build-mode, trust, and parent-Bash checks; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child tool allowlist and recursive delegation is not authorized. This is not a filesystem sandbox; the parent verifies and synthesizes the evidence.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Run one managed ICE child as a file agent or self-delegation (role self with bounded parent instructions; no file needed). Delegate always returns a managed handle after the child starts; periodic check-ins are advisory and do not expire or interrupt the child. Use manage_subagent to inspect, follow up, wait, or stop; read a large final answer with read_subagent_output when the result carries an output artifact. File agents resolve global-first; models follow the deterministic call/primary/fallback/parent order without credential expansion. Safe mode clamps the selected profile to its requested read-only capabilities. Explicit --sub-yolo permits only the selected profile's requested built-in capabilities that are also active in the trusted parent after build-mode, trust, and parent-Bash checks; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child tool allowlist and recursive delegation is not authorized. This is not a filesystem sandbox; the parent verifies and synthesizes the evidence.`,
 		promptSnippet: "Delegate one bounded file/self subagent",
 		promptGuidelines: [...SUBAGENT_DELEGATION_POLICY_GUIDELINES],
-		parameters: delegateForegroundParameters,
+		parameters: delegateParameters,
 		renderCall: (args, theme, context) => renderObservatoryCall("delegate", args, theme, context),
 		renderResult: (result, options, theme, context) => renderObservatoryResult(result, options, theme, context),
 		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
@@ -14210,7 +14581,8 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				context: params.context,
 				contextPacket: params.contextPacket,
 				contextMode: params.contextMode,
-				timeoutMs: params.timeoutMs,
+				checkInIntervalMs: params.checkInIntervalMs,
+				timeoutMs: params.startupTimeoutMs,
 				execution: params.execution,
 				resources: params.resources,
 				acceptanceCriteria: params.acceptanceCriteria,
@@ -14228,6 +14600,15 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					: {}),
 			};
 			try {
+				if (
+					params.checkInIntervalMs !== undefined &&
+					(!Number.isSafeInteger(params.checkInIntervalMs) ||
+						params.checkInIntervalMs < SUBAGENT_CHECKIN_INTERVAL_MS)
+				)
+					throw new SubagentError(
+						"malformed_result",
+						`checkInIntervalMs must be an integer of at least ${SUBAGENT_CHECKIN_INTERVAL_MS} ms.`,
+					);
 				const projectTrusted = ctx.isProjectTrusted();
 				const settingsManager = getParentSettingsManager(ctx);
 				const unsafeAuthorization = authorizeUnsafeSubagentHostExecution(ctx, options, subYoloEnabled());
@@ -14327,13 +14708,11 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
 				const effectiveParentActiveTools = parentActiveTools;
-				const managedLaunch = params.background === true;
 				let resolveManagedHandle: ((handle: SubagentManagedHandle) => void) | undefined;
-				const managedHandlePromise = managedLaunch
-					? new Promise<SubagentManagedHandle>((resolve) => {
-							resolveManagedHandle = resolve;
-						})
-					: undefined;
+				let managedHandleDelivered = false;
+				const managedHandlePromise = new Promise<SubagentManagedHandle>((resolve) => {
+					resolveManagedHandle = resolve;
+				});
 				const runChild = (
 					attempt: 1 | 2,
 					childRequest: NormalizedSubagentRequest,
@@ -14346,6 +14725,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						projectTrusted: childRequest.projectTrusted,
 						unsafeHostExec,
 						attempt,
+						noLifetimeTimeout: true,
 						signal,
 						isAuthorityStillValid: () =>
 							isCurrentSubagentAuthorityValid(ctx, settingsManager, childRequest, hookRuntime),
@@ -14354,71 +14734,107 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						hookRuntime,
 						onEvent: (event) =>
 							publishRuntimeProgress(observatory, toolCallId, "delegate", ctx.cwd, event, onUpdate),
-						...(managedLaunch
-							? {
-									onManagedHandle: (handle: SubagentManagedHandle) => {
-										resolveManagedHandle?.(handle);
-									},
-								}
-							: {}),
+						onManagedHandle: (handle: SubagentManagedHandle) => {
+							const coordinator = getCheckIns(normalized.parentSessionId);
+							if (!coordinator.getState(handle.runId))
+								coordinator.arm(handle.runId, childRequest.checkInIntervalMs, () => {
+									const attention = runner.getRuntimeAttention(handle.runId, normalized.parentSessionId);
+									return {
+										runId: handle.runId,
+										role: childRequest.role,
+										model: modelLabel(childRequest.retryModel ?? model) ?? "unknown",
+										executionStatus: "running" as const,
+										phase: attention?.phase,
+										currentTool: attention?.lastActivities.at(-1)?.toolName,
+										currentPath: attention?.lastActivities.at(-1)?.path,
+										terminal: attention?.state === "terminal",
+										lastProgressAt: attention?.lastProgressAtMs,
+										progressAgeMs: attention?.progressAgeMs,
+										recentActivities: attention?.lastActivities.slice(-3).map(formatSubagentToolActivity),
+										freshness: subagentCheckInFreshness(
+											attention?.progressAgeMs,
+											childRequest.checkInIntervalMs,
+										),
+										isolation: unsafeHostExec ? ("host" as const) : ("read-only" as const),
+									};
+								});
+							managedHandleDelivered = true;
+							rememberManagedRequest(childRequest);
+							resolveManagedHandle?.(handle);
+						},
 					});
 				const runPromise = unsafeHostExec
 					? runChild(1, normalized, effectiveParentActiveTools)
 					: runSubagentWithRecovery(normalized, effectiveParentActiveTools, runChild, {
 							getStopReason: () => (signal?.aborted ? "cancelled" : undefined),
 						});
-				let result: SubagentResult;
-				if (managedLaunch && managedHandlePromise) {
-					// Return control at admission: the same child session keeps running
-					// under the supervisor, and the run promise is kept alive so its
-					// terminal result is published exactly once to the retained ledger.
-					//
-					// The retained child stays bound to the parent run signal handed to
-					// runResolved, exactly like delegate_async's parent-run tie: a normal run
-					// completion never aborts that signal, so returning here does not cancel
-					// the child. It terminates only on an explicit abort/compact/dispose of the
-					// launching run, on manage_subagent stop, or on session shutdown through
-					// runner.shutdown().
-					const outcome = await Promise.race([
-						runPromise.then((value) => ({ kind: "settled" as const, value })),
-						managedHandlePromise.then((handle) => ({ kind: "managed" as const, handle })),
-					]);
-					if (outcome.kind === "managed") {
-						void runPromise.catch(() => {});
-						const observation = runner.peekRuntime(outcome.handle.runId, normalized.parentSessionId);
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Launched retained subagent ${outcome.handle.runId} in managed mode; it keeps the same run ID, child session, model, profile, scope, and tool authority.${observation ? `\n${formatManagedObservation(observation)}` : ""}`,
-								},
-							],
-							details: {
-								managed: outcome.handle,
-								...(observation ? { observation } : {}),
-								launch: createSubagentLaunchProvenance(normalized, model),
+				void runPromise.then(
+					(settled) => {
+						terminalCheckIn(normalized.parentSessionId, normalized.runId);
+						// A result that settles before the handle is returned directly below.
+						if (!managedHandleDelivered) return;
+						const request =
+							managedRequests.get(managedRequestKey(normalized.parentSessionId, settled.runId)) ?? normalized;
+						recordTelemetry(
+							settled.runId,
+							normalized.role,
+							"foreground",
+							settled,
+							verifySubagentResult(settled, request),
+							normalized.acceptanceCriteria.length,
+						);
+					},
+					() => terminalCheckIn(normalized.parentSessionId, normalized.runId),
+				);
+				// Return control at admission: the same child session keeps running
+				// under the supervisor, and the run promise is kept alive so its
+				// terminal result is published exactly once to the retained ledger.
+				//
+				// The retained child stays bound to the parent run signal handed to
+				// runResolved, exactly like delegate_async's parent-run tie: a normal run
+				// completion never aborts that signal, so returning here does not cancel
+				// the child. It terminates only on an explicit abort/compact/dispose of the
+				// launching run, on manage_subagent stop, or on session shutdown through
+				// runner.shutdown().
+				const outcome = await Promise.race([
+					runPromise.then((value) => ({ kind: "settled" as const, value })),
+					managedHandlePromise.then((handle) => ({ kind: "managed" as const, handle })),
+				]);
+				if (outcome.kind === "managed") {
+					void runPromise.catch(() => {});
+					const observation = runner.peekRuntime(outcome.handle.runId, normalized.parentSessionId);
+					// A startup fallback may have admitted a different model than the first candidate.
+					const admittedRequest =
+						managedRequests.get(managedRequestKey(normalized.parentSessionId, outcome.handle.runId)) ??
+						normalized;
+					const launchText = `Launched retained subagent ${outcome.handle.runId} in managed mode; it keeps the same run ID, child session, model, profile, scope, and tool authority.${observation ? `\n${formatManagedObservation(observation)}` : ""}`;
+					return {
+						content: [
+							{
+								type: "text",
+								text: breadthAdvisory ? `Advisory: ${breadthAdvisory}\n\n${launchText}` : launchText,
 							},
-							isError: false,
-						};
-					}
-					result = outcome.value;
-				} else {
-					result = await runPromise;
+						],
+						details: {
+							managed: outcome.handle,
+							...(observation ? { observation } : {}),
+							launch: createSubagentLaunchProvenance(admittedRequest, admittedRequest.retryModel ?? model),
+							...(breadthAdvisory ? { advisory: breadthAdvisory } : {}),
+						},
+						isError: false,
+					};
 				}
-				const verification =
-					result.status === "needs_time"
-						? pendingSubagentVerification(result)
-						: verifySubagentResult(result, normalized);
-				if (result.status !== "needs_time") {
-					recordTelemetry(
-						result.runId,
-						normalized.role,
-						"foreground",
-						result,
-						verification,
-						normalized.acceptanceCriteria.length,
-					);
-				}
+				// Settled before the managed handle existed (startup failure or instant completion).
+				const result = outcome.value;
+				const verification = verifySubagentResult(result, normalized);
+				recordTelemetry(
+					result.runId,
+					normalized.role,
+					"foreground",
+					result,
+					verification,
+					normalized.acceptanceCriteria.length,
+				);
 				const finalResult =
 					!verification.verified && result.status === "completed"
 						? {
@@ -14437,7 +14853,12 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					toolCallId,
 					"delegate",
 					{
-						phase: finalResult.status === "verification_failed" ? "verification_failed" : finalResult.status,
+						phase:
+							finalResult.status === "verification_failed"
+								? "verification_failed"
+								: finalResult.status === "needs_time"
+									? "running"
+									: finalResult.status,
 						status: finalResult.status,
 						runId: finalResult.runId,
 						model: modelLabel(model),
@@ -14470,10 +14891,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						...(unsafeHostExec ? { unsafeHostExec: true } : {}),
 						...(progress ? { progress } : {}),
 					},
-					isError:
-						finalResult.status === "needs_time"
-							? false
-							: finalResult.status !== "completed" || !verification.verified,
+					isError: finalResult.status !== "completed" || !verification.verified,
 				};
 			} catch (error) {
 				const message = redactCredentialText(error instanceof Error ? error.message : String(error));
@@ -14495,7 +14913,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const delegateAsync: DelegateAsyncTool = {
 		name: "delegate_async",
 		label: "delegate_async",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Accept one durable asynchronous ICE child for the current session using the current parent model captured at acceptance time. The returned details.accepted.jobId is the bare identifier for inspect_subagent_job or cancel_subagent_job; details.accepted.resultRef (job:<id>) is display/reference metadata, not a jobId. Do not use a batchId, taskId, or foreground runId with the durable-job tools. The parent-owned scheduler admits bounded active work or FIFO queued work, reserves bounded output, owns cancellation, persists state, and returns acceptance metadata without awaiting the child. Safe mode clamps the selected profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child allowlist and recursive delegation is not authorized.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Delegation is for parallel fan-out, not single errands: never delegate a simple single task you can complete directly with your own parent tools; launch a child only when the plan calls for at least two children (delegate_batch or concurrent background delegate launches). Accept one durable asynchronous ICE child for the current session using the current parent model captured at acceptance time. While it runs, ICE delivers periodic check-ins to the owning session using its configured interval; these are progress notices, not child deadlines, and cancellation remains explicit. The returned details.accepted.jobId is the bare identifier for inspect_subagent_job or cancel_subagent_job; details.accepted.resultRef (job:<id>) is display/reference metadata, not a jobId. Do not use a batchId, taskId, or foreground runId with the durable-job tools. The parent-owned scheduler admits bounded active work or FIFO queued work, owns cancellation, persists state, and returns acceptance metadata without awaiting the child. Safe mode clamps the selected profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load, but model-visible authority remains the explicit child allowlist and recursive delegation is not authorized.`,
 		promptSnippet: "Launch one durable asynchronous subagent",
 		promptGuidelines: [...SUBAGENT_DELEGATION_POLICY_GUIDELINES],
 		parameters: delegateAsyncParameters,
@@ -14518,7 +14936,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					context: params.context,
 					contextPacket: params.contextPacket,
 					contextMode: params.contextMode,
-					timeoutMs: params.timeoutMs,
+					timeoutMs: params.startupTimeoutMs,
 					execution: params.execution,
 					resources: params.resources,
 					acceptanceCriteria: params.acceptanceCriteria,
@@ -14619,8 +15037,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 						],
 						resourcesHash: hashSource(JSON.stringify(normalized.resources)),
 						thinking: normalized.execution.thinking,
-						timeoutMs: normalized.timeoutMs,
-						maxOutputBytes: normalized.execution.maxOutputBytes,
+						checkInIntervalMs: normalized.checkInIntervalMs,
 						...(normalized.execution.temperature !== undefined
 							? { temperature: normalized.execution.temperature }
 							: {}),
@@ -14633,7 +15050,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							: {}),
 						...(normalized.selectedMcpTools ? { mcpTools: [...normalized.selectedMcpTools] } : {}),
 					},
-					plannedOutputBytes: normalized.maxOutputBytes,
 					run: async (jobSignal) => {
 						const authorityFailure = (): SubagentJobRunResult => {
 							const result: SubagentResult = {
@@ -14681,8 +15097,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 								call: {
 									role: normalized.role,
 									thinking: normalized.execution.thinking,
-									timeoutMs: normalized.timeoutMs,
-									maxOutputBytes: normalized.execution.maxOutputBytes,
+									startupTimeoutMs: normalized.timeoutMs,
 								},
 							});
 							const acceptedTools = (normalized.execution.tools ?? normalized.profile.requestedTools).filter(
@@ -14708,7 +15123,6 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 								currentContract.denied ||
 								!currentContract.enabled ||
 								currentContract.values.timeoutMs < normalized.timeoutMs ||
-								currentContract.values.maxOutputBytes < normalized.execution.maxOutputBytes ||
 								acceptedTools.some((tool) => currentContract.deniedTools.includes(tool)) ||
 								acceptedHookIds.join("|") !== currentHookIds.join("|")
 							) {
@@ -14744,33 +15158,50 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 								projectTrusted: childRequest.projectTrusted,
 								unsafeHostExec,
 								attempt,
+								noLifetimeTimeout: true,
 								signal: jobSignal,
 								isAuthorityStillValid: () =>
 									isCurrentSubagentAuthorityValid(ctx, settingsManager, childRequest, hookRuntime),
 								hookRuntime,
+								onManagedHandle: (handle) => {
+									const coordinator = getCheckIns(normalized.parentSessionId);
+									if (coordinator.getState(accepted.jobId)) return;
+									coordinator.arm(accepted.jobId, childRequest.checkInIntervalMs, () => {
+										const attention = runner.getRuntimeAttention(handle.runId, normalized.parentSessionId);
+										const lastActivity = attention?.lastActivities.at(-1);
+										return {
+											jobId: accepted.jobId,
+											role: childRequest.role,
+											model: modelLabel(model) ?? "unknown",
+											executionStatus: "running",
+											phase: attention?.phase,
+											currentTool: lastActivity?.toolName,
+											currentPath: lastActivity?.path,
+											terminal: attention?.state === "terminal",
+											lastProgressAt: attention?.lastProgressAtMs,
+											progressAgeMs: attention?.progressAgeMs,
+											recentActivities: attention?.lastActivities.slice(-3).map(formatSubagentToolActivity),
+											freshness: subagentCheckInFreshness(
+												attention?.progressAgeMs,
+												childRequest.checkInIntervalMs,
+											),
+											isolation: unsafeHostExec ? ("host" as const) : ("read-only" as const),
+										};
+									});
+								},
 								onRuntimeAttention: (attention) => {
 									noteAttention(childRequest.runId, attention);
-									if (attention.state === "awaiting_extension") {
-										registry.markManagedRunState(childRequest.runId, "needs_time");
-									} else if (attention.state === "running" && attention.extensionCount > 0) {
-										registry.markManagedRunState(childRequest.runId, "running");
-									}
 								},
 								onManagedResult: async (managedResult) => {
-									const verification =
-										managedResult.status === "needs_time"
-											? pendingSubagentVerification(managedResult)
-											: verifySubagentResult(managedResult, childRequest);
-									if (managedResult.status !== "needs_time") {
-										recordTelemetry(
-											managedResult.runId,
-											childRequest.role,
-											"async",
-											managedResult,
-											verification,
-											childRequest.acceptanceCriteria.length,
-										);
-									}
+									const verification = verifySubagentResult(managedResult, childRequest);
+									recordTelemetry(
+										managedResult.runId,
+										childRequest.role,
+										"async",
+										managedResult,
+										verification,
+										childRequest.acceptanceCriteria.length,
+									);
 									await registry.resolveManagedRun(childRequest.runId, {
 										result: managedResult,
 										verification,
@@ -14782,20 +15213,16 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							: await runSubagentWithRecovery(normalized, promotionActiveTools, runAttempt, {
 									getStopReason: () => (jobSignal.aborted ? "cancelled" : undefined),
 								});
-						const jobVerification =
-							result.status === "needs_time"
-								? pendingSubagentVerification(result)
-								: verifySubagentResult(result, normalized);
-						if (result.status !== "needs_time") {
-							recordTelemetry(
-								result.runId,
-								normalized.role,
-								"async",
-								result,
-								jobVerification,
-								normalized.acceptanceCriteria.length,
-							);
-						}
+						terminalCheckIn(normalized.parentSessionId, accepted.jobId);
+						const jobVerification = verifySubagentResult(result, normalized);
+						recordTelemetry(
+							result.runId,
+							normalized.role,
+							"async",
+							result,
+							jobVerification,
+							normalized.acceptanceCriteria.length,
+						);
 						return {
 							result,
 							verification: jobVerification,
@@ -14826,6 +15253,48 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 			}
 		},
 	};
+	const readSubagentOutput: ReadSubagentOutputTool = {
+		name: "read_subagent_output",
+		label: "read_subagent_output",
+		description:
+			"Read one bounded UTF-8 chunk from an owner-scoped subagent final-answer artifact. Supply only its opaque artifactId and optional byte offset/length; filesystem paths and run/job IDs are not accepted.",
+		promptSnippet: "Read a retained subagent final-answer chunk",
+		parameters: readSubagentOutputParameters,
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			try {
+				const output = outputArtifacts.read({
+					ownerSessionId: ctx.sessionManager.getSessionId(),
+					...params,
+				});
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Artifact ${output.artifactId} · bytes ${output.offset}-${output.nextOffset}/${output.totalBytes} · nextOffset=${output.nextOffset} · eof=${output.eof} · ${output.contentType} · sha256=${output.sha256} · truncated=${output.truncated}\n\n${output.text}`,
+						},
+					],
+					details: { output },
+					isError: false,
+				};
+			} catch (error) {
+				const artifactError =
+					error instanceof SubagentOutputArtifactError
+						? error
+						: new SubagentOutputArtifactError(
+								"artifact_storage_failure",
+								"Subagent output artifact read is unavailable.",
+							);
+				const details = { error: { code: artifactError.code, message: artifactError.message } };
+				return {
+					content: [
+						{ type: "text", text: `Output read failed (${artifactError.code}): ${artifactError.message}` },
+					],
+					details,
+					isError: true,
+				};
+			}
+		},
+	};
 	const inspectSubagentJob: SubagentJobTool = {
 		name: "inspect_subagent_job",
 		label: "inspect_subagent_job",
@@ -14839,17 +15308,27 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 					throw new SubagentJobError("job_invalid", "Background jobs are unavailable during session teardown.");
 				const inspection = jobs.inspect(params.jobId, ctx.sessionManager.getSessionId());
 				const attention =
-					inspection.job.status === "needs_time" && inspection.job.runId
+					inspection.job.status === "running" && inspection.job.runId
 						? runner.getRuntimeAttention(inspection.job.runId, ctx.sessionManager.getSessionId())
 						: undefined;
+				const checkIn = checkIns.get(ctx.sessionManager.getSessionId())?.getState(params.jobId);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${formatSubagentJobInspection(inspection)}${attention ? `\n\n${formatRuntimeAttention(attention)}\n\nUse manage_subagent with runId ${inspection.job.runId} to extend or stop the same retained child.` : ""}`,
+							text: [
+								formatSubagentJobInspection(inspection),
+								attention ? formatRuntimeAttention(attention) : undefined,
+								formatSubagentCheckInState(checkIn),
+								attention
+									? `Use manage_subagent with runId ${inspection.job.runId} to inspect, follow up, wait, or stop the same retained child.`
+									: undefined,
+							]
+								.filter((part): part is string => part !== undefined)
+								.join("\n\n"),
 						},
 					],
-					details: { inspection, ...(attention ? { attention } : {}) },
+					details: { inspection, ...(attention ? { attention } : {}), ...(checkIn ? { checkIn } : {}) },
 					isError: false,
 				};
 			} catch (error) {
@@ -14889,10 +15368,82 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 			}
 		},
 	};
+	const inspectSubagentBatch: InspectSubagentBatchTool = {
+		name: "inspect_subagent_batch",
+		label: "inspect_subagent_batch",
+		description:
+			"Inspect one owner-scoped managed delegate_batch or review_batch. Pass the bare batchId returned by the batch tool, never resultRef or a child runId. Completed batches include their deterministic bounded aggregate result; each child runId can be managed separately with manage_subagent.",
+		promptSnippet: "Inspect a managed sibling batch",
+		parameters: subagentBatchIdParameters,
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			try {
+				const record = ownedManagedBatch(params.batchId, ctx.sessionManager.getSessionId());
+				const inspection = snapshotManagedBatch(record);
+				const text =
+					record.result && "reviewers" in record.result
+						? formatReviewBatchToolResult(record.result)
+						: record.result
+							? formatBatchToolResult(record.result)
+							: [
+									`Managed ${record.kind} batch ${record.batchId} is ${record.state}.`,
+									...inspection.tasks.map(
+										(task) => `- ${task.taskId}: ${task.status} · ${task.role} · ${task.runId}`,
+									),
+									"Use inspect_subagent_batch again for the aggregate result; manage each running child by its runId.",
+								].join("\n");
+				return { content: [{ type: "text", text }], details: { inspection }, isError: false };
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Managed batch inspection rejected: ${error instanceof Error ? error.message : String(error)}`,
+						},
+					],
+					details: formatSubagentToolError(error),
+					isError: true,
+				};
+			}
+		},
+	};
+	const cancelSubagentBatch: CancelSubagentBatchTool = {
+		name: "cancel_subagent_batch",
+		label: "cancel_subagent_batch",
+		description:
+			"Cancel one owner-scoped managed sibling batch and wait for its running children to settle. Pass the bare batchId returned by delegate_batch or review_batch. This only cancels; it never integrates writer changes or widens child authority.",
+		promptSnippet: "Cancel a managed sibling batch",
+		parameters: subagentBatchIdParameters,
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			try {
+				const record = ownedManagedBatch(params.batchId, ctx.sessionManager.getSessionId());
+				if (record.completion && !record.result) {
+					record.controller.abort();
+					await record.completion.catch(() => undefined);
+				}
+				const inspection = snapshotManagedBatch(record);
+				return {
+					content: [{ type: "text", text: `Managed batch ${record.batchId} is ${record.state}.` }],
+					details: { inspection },
+					isError: false,
+				};
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Managed batch cancellation rejected: ${error instanceof Error ? error.message : String(error)}`,
+						},
+					],
+					details: formatSubagentToolError(error),
+					isError: true,
+				};
+			}
+		},
+	};
 	const delegateBatch: DelegateBatchTool = {
 		name: "delegate_batch",
 		label: "delegate_batch",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never wrap a single task in a batch: delegate_batch is for two or more independent sibling tasks, so a lone task is done directly in the parent. Run up to eight independently scoped sibling ICE children through the same atomic executor using the current parent model. Each child uses a fresh session and a parent-owned bounded complete-report output budget. The result identifies the batch with batchId and each item with taskId; those values are report identifiers only, not a durable jobId or a manageable foreground runId. Do not pass a batchId or taskId to inspect_subagent_job or manage_subagent. Safe mode clamps each selected profile to requested read-only capabilities. Explicit --sub-yolo permits only each profile's requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains each explicit child allowlist and recursive delegation is not authorized. The parent synthesizes the independent evidence.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never wrap a single task in a batch: delegate_batch is for two or more independent sibling tasks, so a lone task is done directly in the parent. Run up to eight independently scoped sibling ICE children through the same atomic executor using the current parent model. Each child uses a fresh session; its final answer is retained with fixed host-owned inline limits plus an optional output artifact. The tool always returns an owner-scoped batchId and child runIds after preflight so the parent remains available; inspect with inspect_subagent_batch, cancel the aggregate with cancel_subagent_batch, manage an individual child by its runId, or read a child output artifact with read_subagent_output. batchId/resultRef are not durable jobIds. Safe mode clamps each selected profile to requested read-only capabilities. Explicit --sub-yolo permits only each profile's requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains each explicit child allowlist and recursive delegation is not authorized. The parent synthesizes the independent evidence.`,
 		promptSnippet: "Delegate bounded parallel profile-aware subagents",
 		promptGuidelines: [
 			...SUBAGENT_DELEGATION_POLICY_GUIDELINES,
@@ -14927,7 +15478,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 							context: task.context,
 							contextPacket: task.contextPacket,
 							contextMode: task.contextMode,
-							timeoutMs: task.timeoutMs,
+							checkInIntervalMs: task.checkInIntervalMs,
 							execution: task.execution,
 							resources: task.resources,
 							acceptanceCriteria: task.acceptanceCriteria,
@@ -15003,77 +15554,160 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				const effectiveParentActiveTools = unsafeAuthorization
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
-				const result = await runResolvedSubagentBatch(tasks, effectiveParentActiveTools, runner, {
+				if (signal?.aborted) throw new SubagentError("cancellation", "Batch was cancelled before admission.");
+				const batchId = randomUUID();
+				const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
+				const backgroundOptions = {
+					batchId,
 					concurrency: params.concurrency,
-					concurrencyPolicy: resolveSubagentConcurrencyPolicyFromSettings(settingsManager),
+					concurrencyPolicy,
 					admission: subagentAdmission,
 					failFast: params.failFast,
-					totalBudgetBytes: params.totalBudgetBytes,
 					modelRuntime: ctx.modelRegistry.getRuntime(),
 					settingsManager,
 					unsafeHostExec,
-					signal,
-					timeoutMs: params.timeoutMs,
-					isAuthorityStillValid: (request, hookRuntime) =>
+					isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
 						isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					onTaskState: (event) =>
-						publishBatchTaskProgress(observatory, toolCallId, "delegate_batch", event, onUpdate),
-					onEvent: (event) =>
-						publishRuntimeProgress(observatory, toolCallId, "delegate_batch", ctx.cwd, event, onUpdate),
-				});
-				for (const item of result.items) {
-					recordTelemetry(
-						item.result.runId,
-						item.launch.profile.name,
-						"batch",
-						item.result,
-						item.verification,
-						tasks.find((task) => task.id === item.taskId)?.request.acceptanceCriteria.length ?? 0,
-					);
-					publishWorkflowProgress(
-						observatory,
-						`${toolCallId}/${item.taskId}`,
-						"delegate_batch",
-						{
-							phase: terminalProgressPhase(item.result.status),
-							status: item.result.status,
-							runId: item.result.runId,
-							taskId: item.taskId,
-							model: item.launch.model,
-							cwd: ctx.cwd,
-							evidenceCount: item.result.evidence?.paths.length,
-							usage: item.result.usage,
-							diagnostics: item.result.diagnostics.map((diagnostic) => diagnostic.code),
-						},
-						onUpdate,
-					);
-				}
-				const progress = publishWorkflowProgress(
-					observatory,
-					toolCallId,
-					"delegate_batch",
-					{
-						phase:
-							result.status === "completed"
-								? "completed"
-								: result.status === "cancelled"
-									? "cancelled"
-									: result.status === "timed_out"
-										? "timed_out"
-										: "failed",
-						status: result.status,
-						runId: result.batchId,
-						cwd: ctx.cwd,
-						usage: result.usage,
-						diagnostics: result.diagnostics.map((diagnostic) => diagnostic.code),
-					},
-					onUpdate,
+				};
+				buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
+				const batchController = new AbortController();
+				const abortBatch = (): void => batchController.abort();
+				if (signal) signal.addEventListener("abort", abortBatch, { once: true });
+				const record = createManagedBatch(
+					batchId,
+					ctx.sessionManager.getSessionId(),
+					"batch",
+					batchController,
+					tasks,
 				);
-				const safeResult = redactSubagentBatchResult(result);
+				const completion = runResolvedSubagentBatch(tasks, effectiveParentActiveTools, runner, {
+					...backgroundOptions,
+					managedBackground: true,
+					signal: batchController.signal,
+					onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
+					onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
+					onTaskState: (event) => {
+						const state = record.tasks.get(event.taskId);
+						if (state) {
+							state.status =
+								event.type === "task_queued"
+									? "queued"
+									: event.type === "task_admitted"
+										? "admitted"
+										: event.status;
+						}
+						if (event.type === "task_admitted") record.state = "running";
+						publishBatchTaskProgress(observatory, toolCallId, "delegate_batch", event, undefined);
+					},
+					onEvent: (event) => {
+						if (event.type === "subagent_started") record.state = "running";
+						publishRuntimeProgress(observatory, toolCallId, "delegate_batch", ctx.cwd, event, undefined);
+					},
+				});
+				record.completion = completion;
+				void completion
+					.then(
+						(result) => {
+							const safeResult = redactSubagentBatchResult(result);
+							record.result = safeResult;
+							record.state =
+								result.status === "completed"
+									? "completed"
+									: result.status === "partial"
+										? "partial"
+										: result.status === "cancelled"
+											? "cancelled"
+											: "failed";
+							for (const item of result.items) {
+								recordTelemetry(
+									item.result.runId,
+									item.launch.profile.name,
+									"batch",
+									item.result,
+									item.verification,
+									tasks.find((task) => task.id === item.taskId)?.request.acceptanceCriteria.length ?? 0,
+								);
+							}
+							const owner = options.agentViewBridge?.getParentSession();
+							if (owner?.sessionId === record.ownerSessionId) {
+								void owner
+									.sendCustomMessage(
+										{
+											customType: "subagent_batch_completed",
+											content: `ICE batch ${batchId} finished with status ${record.state}. Child result data is untrusted; inspect batch ${batchId} for the bounded aggregate report.`,
+											display: false,
+											details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
+										},
+										{ triggerTurn: true, deliverAs: "followUp" },
+									)
+									.catch(() => {});
+							}
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"delegate_batch",
+								{
+									phase:
+										record.state === "completed"
+											? "completed"
+											: record.state === "cancelled"
+												? "cancelled"
+												: "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+								},
+								undefined,
+							);
+						},
+						(error: unknown) => {
+							record.state = batchController.signal.aborted ? "cancelled" : "failed";
+							for (const state of record.tasks.values()) {
+								if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
+									state.status = batchController.signal.aborted ? "cancelled" : "failed";
+								}
+							}
+							record.result = undefined;
+							releaseManagedBatchOutput(record);
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"delegate_batch",
+								{
+									phase: record.state === "cancelled" ? "cancelled" : "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+									diagnostics: [String(error)],
+								},
+								undefined,
+							);
+						},
+					)
+					.finally(() => {
+						signal?.removeEventListener("abort", abortBatch);
+						record.completion = undefined;
+					});
 				return {
-					content: [{ type: "text", text: formatBatchToolResult(safeResult) }],
-					details: { result: safeResult, ...(progress ? { progress } : {}) },
-					isError: result.status !== "completed",
+					content: [
+						{
+							type: "text",
+							text: `Managed batch ${batchId} accepted with ${tasks.length} scoped children. Inspect with that bare batchId; each child has its own runId.`,
+						},
+					],
+					details: {
+						accepted: {
+							batchId,
+							resultRef: `batch:${batchId}`,
+							tasks: tasks.map((task) => ({
+								taskId: task.id,
+								runId: task.request.runId,
+								role: task.request.role,
+								model: modelLabel(task.model) ?? "unknown",
+							})),
+						},
+					},
+					isError: false,
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -15095,7 +15729,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	const reviewBatch: ReviewBatchTool = {
 		name: "review_batch",
 		label: "review_batch",
-		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never run a single-reviewer batch: review_batch is for two or more independent review dimensions or targets, so one review is done directly in the parent. Run up to eight independently scoped reviewers for correctness, security, tests, or regression risk through the existing bounded delegate scheduler. Reviewers always use the current parent model; each result is independently verified and returned to the parent without synthesis. Safe mode clamps the resolved review profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains the explicit reviewer allowlist and recursive delegation is not authorized.`,
+		description: `${SUBAGENT_SCOPE_TOOL_GUIDANCE} ${SUBAGENT_INTERNAL_REPORT_GUIDANCE} Never run a single-reviewer batch: review_batch is for two or more independent review dimensions or targets, so one review is done directly in the parent. Run up to eight independently scoped reviewers for correctness, security, tests, or regression risk through the existing bounded delegate scheduler. Reviewers always use the current parent model and preserve independent verification. Always returns an owner-scoped batchId and child runIds after preflight; inspect the deterministic aggregate with inspect_subagent_batch, cancel with cancel_subagent_batch, or manage each child by its runId. batchId/resultRef are not durable jobIds. Safe mode clamps the resolved review profile to requested read-only capabilities. Explicit --sub-yolo permits only profile-requested built-in capabilities that are also active in the trusted parent; it does not grant every parent tool. Trusted ambient resources may load in YOLO, but model-visible authority remains the explicit reviewer allowlist and recursive delegation is not authorized.`,
 		promptSnippet: "Run bounded parallel typed reviewers",
 		promptGuidelines: [
 			...SUBAGENT_DELEGATION_POLICY_GUIDELINES,
@@ -15187,75 +15821,161 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 				const effectiveParentActiveTools = unsafeAuthorization
 					? [...unsafeAuthorization.parentActiveTools]
 					: [...ice.getActiveTools()];
-				const result = await runResolvedReviewBatch(tasks, effectiveParentActiveTools, runner, {
+				if (signal?.aborted)
+					throw new SubagentError("cancellation", "Review batch was cancelled before admission.");
+				const batchId = randomUUID();
+				const concurrencyPolicy = resolveSubagentConcurrencyPolicyFromSettings(settingsManager);
+				const backgroundOptions = {
+					batchId,
 					concurrency: params.concurrency,
+					concurrencyPolicy,
+					admission: subagentAdmission,
 					failFast: params.failFast,
-					totalBudgetBytes: params.totalBudgetBytes,
 					modelRuntime: ctx.modelRegistry.getRuntime(),
 					settingsManager,
 					unsafeHostExec,
-					signal,
-					timeoutMs: params.timeoutMs,
-					isAuthorityStillValid: (request, hookRuntime) =>
+					isAuthorityStillValid: (request: NormalizedSubagentRequest, hookRuntime?: SubagentHookRuntime) =>
 						isCurrentSubagentAuthorityValid(ctx, settingsManager, request, hookRuntime),
-					onTaskState: (event) =>
-						publishBatchTaskProgress(observatory, toolCallId, "review_batch", event, onUpdate),
-					onEvent: (event) =>
-						publishRuntimeProgress(observatory, toolCallId, "review_batch", ctx.cwd, event, onUpdate),
-				});
-				for (const reviewer of result.reviewers) {
-					recordTelemetry(
-						reviewer.result.runId,
-						reviewer.launch.profile.name,
-						"review",
-						reviewer.result,
-						reviewer.verification,
-						0,
-					);
-					publishWorkflowProgress(
-						observatory,
-						`${toolCallId}/${reviewer.taskId}`,
-						"review_batch",
-						{
-							phase: terminalProgressPhase(reviewer.result.status),
-							status: reviewer.result.status,
-							runId: reviewer.result.runId,
-							taskId: reviewer.taskId,
-							model: reviewer.launch.model,
-							cwd: ctx.cwd,
-							evidenceCount: reviewer.result.evidence?.paths.length,
-							usage: reviewer.result.usage,
-							diagnostics: reviewer.result.diagnostics.map((diagnostic) => diagnostic.code),
-						},
-						onUpdate,
-					);
-				}
-				const progress = publishWorkflowProgress(
-					observatory,
-					toolCallId,
-					"review_batch",
-					{
-						phase:
-							result.status === "completed"
-								? "completed"
-								: result.status === "cancelled"
-									? "cancelled"
-									: result.status === "timed_out"
-										? "timed_out"
-										: "failed",
-						status: result.status,
-						runId: result.batchId,
-						cwd: ctx.cwd,
-						usage: result.usage,
-						diagnostics: result.diagnostics.map((diagnostic) => diagnostic.code),
-					},
-					onUpdate,
+				};
+				buildSubagentLaunchPreflight(tasks, effectiveParentActiveTools, backgroundOptions);
+				const batchController = new AbortController();
+				const abortBatch = (): void => batchController.abort();
+				if (signal) signal.addEventListener("abort", abortBatch, { once: true });
+				const record = createManagedBatch(
+					batchId,
+					ctx.sessionManager.getSessionId(),
+					"review",
+					batchController,
+					tasks,
 				);
-				const safeResult = redactReviewBatchResult(result);
+				const completion = runResolvedReviewBatch(tasks, effectiveParentActiveTools, runner, {
+					...backgroundOptions,
+					managedBackground: true,
+					signal: batchController.signal,
+					onManagedHandle: (task, handle) => armManagedBatchChild(record, task, handle, unsafeHostExec),
+					onChildTerminal: (task, result) => noteManagedBatchChildTerminal(record, task, result),
+					onTaskState: (event) => {
+						const state = record.tasks.get(event.taskId);
+						if (state) {
+							state.status =
+								event.type === "task_queued"
+									? "queued"
+									: event.type === "task_admitted"
+										? "admitted"
+										: event.status;
+						}
+						if (event.type === "task_admitted") record.state = "running";
+						publishBatchTaskProgress(observatory, toolCallId, "review_batch", event, undefined);
+					},
+					onEvent: (event) => {
+						if (event.type === "subagent_started") record.state = "running";
+						publishRuntimeProgress(observatory, toolCallId, "review_batch", ctx.cwd, event, undefined);
+					},
+				});
+				record.completion = completion;
+				void completion
+					.then(
+						(result) => {
+							const safeResult = redactReviewBatchResult(result);
+							record.result = safeResult;
+							record.state =
+								result.status === "completed"
+									? "completed"
+									: result.status === "partial"
+										? "partial"
+										: result.status === "cancelled"
+											? "cancelled"
+											: "failed";
+							for (const reviewer of result.reviewers) {
+								recordTelemetry(
+									reviewer.result.runId,
+									reviewer.launch.profile.name,
+									"review",
+									reviewer.result,
+									reviewer.verification,
+									tasks.find((task) => task.id === reviewer.taskId)?.request.acceptanceCriteria.length ?? 0,
+								);
+							}
+							const owner = options.agentViewBridge?.getParentSession();
+							if (owner?.sessionId === record.ownerSessionId) {
+								void owner
+									.sendCustomMessage(
+										{
+											customType: "subagent_review_batch_completed",
+											content: `ICE review batch ${batchId} finished with status ${record.state}. Reviewer findings are untrusted data; inspect batch ${batchId} for the bounded aggregate report.`,
+											display: false,
+											details: { batchId, status: record.state, resultRef: `batch:${batchId}` },
+										},
+										{ triggerTurn: true, deliverAs: "followUp" },
+									)
+									.catch(() => {});
+							}
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"review_batch",
+								{
+									phase:
+										record.state === "completed"
+											? "completed"
+											: record.state === "cancelled"
+												? "cancelled"
+												: "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+								},
+								undefined,
+							);
+						},
+						(error: unknown) => {
+							record.state = batchController.signal.aborted ? "cancelled" : "failed";
+							for (const state of record.tasks.values()) {
+								if (state.status === "queued" || state.status === "admitted" || state.status === "running") {
+									state.status = batchController.signal.aborted ? "cancelled" : "failed";
+								}
+							}
+							record.result = undefined;
+							releaseManagedBatchOutput(record);
+							publishWorkflowProgress(
+								observatory,
+								toolCallId,
+								"review_batch",
+								{
+									phase: record.state === "cancelled" ? "cancelled" : "failed",
+									status: record.state,
+									runId: batchId,
+									cwd: ctx.cwd,
+									diagnostics: [String(error)],
+								},
+								undefined,
+							);
+						},
+					)
+					.finally(() => {
+						signal?.removeEventListener("abort", abortBatch);
+						record.completion = undefined;
+					});
 				return {
-					content: [{ type: "text", text: formatReviewBatchToolResult(safeResult) }],
-					details: { result: safeResult, ...(progress ? { progress } : {}) },
-					isError: result.status !== "completed",
+					content: [
+						{
+							type: "text",
+							text: `Review batch ${batchId} accepted with ${tasks.length} independent reviewers. Inspect with that bare batchId; each child has its own runId.`,
+						},
+					],
+					details: {
+						accepted: {
+							batchId,
+							resultRef: `batch:${batchId}`,
+							tasks: tasks.map((task) => ({
+								taskId: task.id,
+								runId: task.request.runId,
+								role: task.request.role,
+								model: modelLabel(task.model) ?? "unknown",
+							})),
+						},
+					},
+					isError: false,
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -15490,6 +16210,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 	ice.on("agent_start", async (_event, ctx) => {
 		parentBusy = true;
 		beginParentRun(ctx);
+		for (const coordinator of checkIns.values()) coordinator.ownerOpportunity();
 	});
 	ice.on("agent_settled", async () => {
 		const state = parentRunState;
@@ -15497,6 +16218,7 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		if (state?.cancellationPromise) await state.cancellationPromise;
 		if (state) detachParentRun(state);
 		parentBusy = false;
+		for (const coordinator of checkIns.values()) coordinator.flushPending();
 		drainCompletionNotifications();
 	});
 	ice.on("session_shutdown", async () => {
@@ -15507,18 +16229,35 @@ export default function iceSubagents(ice: ExtensionAPI, options: IceSubagentsOpt
 		if (state?.signal?.aborted) void cancelParentRun(state);
 		if (state?.cancellationPromise) await state.cancellationPromise;
 		if (state) detachParentRun(state);
+		for (const record of managedBatches.values()) record.controller.abort();
+		for (const controller of managedWriterControllers) controller.abort();
 		const registry = jobs;
 		jobs = undefined;
 		if (registry) await registry.shutdown();
+		await Promise.allSettled([...managedWriterTasks]);
+		for (const record of managedWriters.values()) releaseManagedWriterOutput(record);
+		managedWriters.clear();
+		for (const coordinator of checkIns.values()) coordinator.dispose();
+		checkIns.clear();
+		unsubscribeCheckInOwner?.();
 		await runner.shutdown();
+		await Promise.allSettled(
+			[...managedBatches.values()].flatMap((record) => (record.completion ? [record.completion] : [])),
+		);
+		for (const record of managedBatches.values()) releaseManagedBatchOutput(record);
+		managedBatches.clear();
+		outputArtifacts.dispose();
 	});
 
 	ice.registerTool(listProfiles);
 	ice.registerTool(manageSubagent);
 	ice.registerTool(delegate);
 	ice.registerTool(delegateAsync);
+	ice.registerTool(readSubagentOutput);
 	ice.registerTool(inspectSubagentJob);
 	ice.registerTool(cancelSubagentJob);
+	ice.registerTool(inspectSubagentBatch);
+	ice.registerTool(cancelSubagentBatch);
 	ice.registerTool(delegateBatch);
 	ice.registerTool(reviewBatch);
 	ice.registerTool(delegateWrite);

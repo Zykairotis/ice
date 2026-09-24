@@ -14,6 +14,7 @@ import { ModelRuntime } from "../src/core/model-runtime.ts";
 import iceSubagents, {
 	collectWriterPatchArtifact,
 	createWriterWorkspace,
+	normalizeWriterRequest,
 	type WriterPatchArtifact,
 	type WriterResult,
 } from "../src/ice-subagents.ts";
@@ -91,6 +92,7 @@ interface W5ToolResult {
 
 interface W5Tool {
 	executionMode?: "sequential" | "parallel";
+	parameters?: unknown;
 	execute: (...args: unknown[]) => Promise<W5ToolResult>;
 }
 
@@ -127,6 +129,17 @@ function registeredWriterTools(options: { verifier?: string; active?: string[] }
 	};
 }
 
+/** delegate_write always returns an accepted handle; wait on it for the terminal writer result. */
+async function settleWriter(tools: W5Tools, context: unknown, launched: W5ToolResult): Promise<W5ToolResult> {
+	const accepted = (launched.details as { accepted?: { runId: string } } | undefined)?.accepted;
+	if (!accepted) return launched;
+	const waited = await tools
+		.get("manage_subagent")
+		.execute("w5-wait", { action: "wait", runId: accepted.runId, waitMs: 60_000 }, undefined, undefined, context);
+	const result = (waited.details as { writer?: { result?: WriterResult } }).writer?.result;
+	return { isError: result?.status !== "completed", details: { result } };
+}
+
 function toolDetails<T>(result: W5ToolResult): T {
 	return result.details as T;
 }
@@ -161,33 +174,69 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 		expect(tools.get("delegate_write").executionMode).toBe("sequential");
 	});
 
+	it("keeps writer final-answer retention host-owned", async () => {
+		const { cwd, head } = await createGitWorkspace();
+		const request = {
+			parentSessionId: "w5-parent",
+			task: "Create a patch.",
+			scope: { roots: ["src"] },
+			baseCommit: head,
+			cwd,
+		};
+		const normalized = normalizeWriterRequest(request, cwd);
+		expect(normalized).not.toHaveProperty("maxOutputBytes");
+		expect(() => normalizeWriterRequest({ ...request, maxOutputBytes: 1_024 } as never, cwd)).toThrow(
+			/maxOutputBytes.*removed/i,
+		);
+
+		const schema = registeredWriterTools().get("delegate_write").parameters as {
+			properties?: Record<string, unknown>;
+		};
+		expect(schema.properties).not.toHaveProperty("maxOutputBytes");
+	});
+
 	it("runs a faux writer through delegate_write, inspection, and successful integration", async () => {
 		const { cwd, head } = await createGitWorkspace();
 		const agentDir = await mkdtemp(join(tmpdir(), "ice-w5-agent-"));
 		tempDirs.push(agentDir);
 		const { faux, model, modelRegistry } = await createFauxRuntime();
+		const finalAnswer = "writer final answer\n".repeat(900);
 		faux.setResponses([
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/child.ts", content: "child\n" })], {
 				stopReason: "toolUse",
 			}),
-			fauxAssistantMessage("completed"),
+			fauxAssistantMessage(finalAnswer),
 		]);
 		const previousAgentDir = process.env.ICE_CODING_AGENT_DIR;
 		process.env.ICE_CODING_AGENT_DIR = agentDir;
 		try {
 			const tools = registeredWriterTools({ verifier: verifier(0) });
 			const context = writerContext(cwd, modelRegistry, model);
-			const delegated = await tools
-				.get("delegate_write")
-				.execute(
+			const delegated = await settleWriter(
+				tools,
+				context,
+				await tools.get("delegate_write").execute(
 					"w5-delegate",
-					{ task: "Create src/child.ts with one line.", baseCommit: head, scope: { roots: ["src"] } },
+					{
+						task: "Create src/child.ts with one line.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+					},
 					undefined,
 					undefined,
 					context,
-				);
+				),
+			);
 			expect(delegated).toMatchObject({ isError: false, details: { result: { status: "completed" } } });
-			const artifact = toolDetails<{ result: WriterResult }>(delegated).result.patchArtifact;
+			const result = toolDetails<{ result: WriterResult }>(delegated).result;
+			expect(result.output).toMatchObject({
+				captureStatus: "artifact_complete",
+				text: finalAnswer.slice(0, 8 * 1024),
+				originalBytes: Buffer.byteLength(finalAnswer),
+				artifact: { schemaVersion: 2, storedBytes: Buffer.byteLength(finalAnswer), truncated: false },
+			});
+			expect(result.output?.artifact).not.toHaveProperty("path");
+			const artifact = result.patchArtifact;
 			if (!artifact) throw new Error("W5 faux writer returned no artifact");
 			expect(artifact.files).toMatchObject([{ path: "src/child.ts", change: "add" }]);
 
@@ -403,7 +452,7 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 		}
 	});
 
-	it("returns failed, cancelled, and timed-out writer results without proposals", async () => {
+	it("returns failed and cancelled results but does not impose a child lifetime timeout", async () => {
 		const { cwd, head } = await createGitWorkspace();
 		const agentDir = await mkdtemp(join(tmpdir(), "ice-w5-agent-"));
 		tempDirs.push(agentDir);
@@ -418,16 +467,20 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 				new ModelRegistry(await ModelRuntime.create({ modelsPath: null })),
 				undefined,
 			);
-			const failed = await tools.get("delegate_write").execute(
-				"failed",
-				{
-					task: "Fail the writer by denying its complete capability.",
-					baseCommit: head,
-					scope: { roots: ["src"] },
-				},
-				undefined,
-				undefined,
+			const failed = await settleWriter(
+				tools,
 				failedContext,
+				await tools.get("delegate_write").execute(
+					"failed",
+					{
+						task: "Fail the writer by denying its complete capability.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+					},
+					undefined,
+					undefined,
+					failedContext,
+				),
 			);
 			expect(failed).toMatchObject({ isError: true, details: { result: { status: "failed" } } });
 			expect(toolDetails<{ result: WriterResult }>(failed).result.patchArtifact).toBeUndefined();
@@ -452,17 +505,27 @@ describe("W5 writer workflow end-to-end adversarial gate", () => {
 					return fauxAssistantMessage("late");
 				},
 			]);
-			const timedOut = await tools
-				.get("delegate_write")
-				.execute(
-					"timed-out",
-					{ task: "Timeout the writer.", baseCommit: head, scope: { roots: ["src"] }, timeoutMs: 5 },
+			const longRunning = await settleWriter(
+				tools,
+				context,
+				await tools.get("delegate_write").execute(
+					"long-running",
+					{
+						task: "Continue until the bounded final report is ready.",
+						baseCommit: head,
+						scope: { roots: ["src"] },
+						startupTimeoutMs: 5,
+					},
 					undefined,
 					undefined,
 					context,
-				);
-			expect(timedOut).toMatchObject({ isError: true, details: { result: { status: "timed_out" } } });
-			expect(toolDetails<{ result: WriterResult }>(timedOut).result.patchArtifact).toBeUndefined();
+				),
+			);
+			expect(longRunning).toMatchObject({ isError: false, details: { result: { status: "completed" } } });
+			expect(toolDetails<{ result: WriterResult }>(longRunning).result.patchArtifact).toMatchObject({
+				changedFileCount: 0,
+				patchBytes: 0,
+			});
 		} finally {
 			if (previousAgentDir === undefined) delete process.env.ICE_CODING_AGENT_DIR;
 			else process.env.ICE_CODING_AGENT_DIR = previousAgentDir;

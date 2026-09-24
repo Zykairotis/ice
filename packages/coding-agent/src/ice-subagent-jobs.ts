@@ -26,8 +26,8 @@ export const SUBAGENT_JOB_DEFAULT_CONCURRENCY = SUBAGENT_CONCURRENCY_LIMITS.bund
 /** Hard ceiling for active background jobs; shared admission may cap lower. */
 export const SUBAGENT_JOB_MAX_CONCURRENCY = SUBAGENT_CONCURRENCY_LIMITS.hardCap;
 export const SUBAGENT_JOB_QUEUE_LIMIT = 8;
-export const SUBAGENT_JOB_OWNER_OUTPUT_BUDGET = 256 * 1024;
-export const SUBAGENT_JOB_DEFAULT_OUTPUT_BYTES = 24 * 1024;
+// Historical snapshot validation only; new durable admission does not reserve output bytes.
+const LEGACY_JOB_OWNER_OUTPUT_BUDGET = 256 * 1024;
 const MAX_DURABLE_DIAGNOSTIC_BYTES = 1024;
 const MAX_DURABLE_SUMMARY_BYTES = 24 * 1024;
 const MAX_DURABLE_VERIFICATION_REASON_BYTES = 1024;
@@ -53,8 +53,12 @@ export interface SubagentJobContract {
 	resourcesHash?: string;
 	route?: IceSubagentRouteSnapshot;
 	thinking: string;
-	timeoutMs: number;
-	maxOutputBytes: number;
+	/** Periodic supervisory check-in interval; omitted by legacy snapshots. */
+	checkInIntervalMs?: number;
+	/** Legacy accepted lifetime timeout; new background jobs do not have one. */
+	timeoutMs?: number;
+	/** Historical final-answer cap; decoded for inspection only and never applied to new work. */
+	maxOutputBytes?: number;
 	temperature?: number;
 	topP?: number;
 	tools: readonly string[];
@@ -65,6 +69,13 @@ export interface SubagentJobContract {
 	modelCandidateSkips?: readonly IceModelCandidateSkip[];
 	/** Exact selected MCP tools (server/tool), if any. */
 	mcpTools?: readonly string[];
+}
+
+export interface SubagentJobCheckInMetadata {
+	sequence: number;
+	lastAcknowledgedAt?: number;
+	pendingSince?: number;
+	overdueSince?: number;
 }
 
 export interface SubagentJobRecord {
@@ -84,6 +95,8 @@ export interface SubagentJobRecord {
 	startedAt?: string;
 	finishedAt?: string;
 	runId?: string;
+	/** Minimal durable scheduler metadata; raw check-in notice bodies are never persisted. */
+	checkIn?: SubagentJobCheckInMetadata;
 	resultRef: string;
 }
 
@@ -166,16 +179,10 @@ export interface SubagentJobRunResult {
 export interface SubagentJobInspection {
 	job: Readonly<SubagentJobRecord>;
 	queuePosition?: number;
-	budget?: Readonly<{
-		plannedOutputBytes: number;
-		reservedOutputBytes: number;
-		ownerReservedOutputBytes: number;
-		ownerBudgetBytes: number;
-		/** Present when a shared admission coordinator bounds active jobs. */
-		ownerActiveJobs?: number;
-		/** Number of queued jobs owned by this registry at the inspection boundary. */
-		ownerQueuedJobs?: number;
-		ownerActiveJobsCap?: number;
+	scheduling?: Readonly<{
+		ownerActiveJobs: number;
+		ownerQueuedJobs: number;
+		ownerActiveJobsCap: number;
 	}>;
 	result?: Readonly<SubagentJobResultEnvelope>;
 	/** Present when the full result expired from retention; final status stays visible. */
@@ -213,7 +220,6 @@ interface SubagentJobRegistryOptions {
 	now?: () => Date;
 	maxActiveJobs?: number;
 	maxQueuedJobs?: number;
-	maxAggregateOutputBytes?: number;
 	/** Parent-owned root under which runtime report artifacts are generated. */
 	reportArtifactRoot?: string;
 	/** Shared permit accounting across batch and job admission; optional for legacy consumers. */
@@ -404,6 +410,7 @@ function cloneResult(result: SubagentJobResultEnvelope): SubagentJobResultEnvelo
 function cloneJob(job: SubagentJobRecord): SubagentJobRecord {
 	return Object.freeze({
 		...job,
+		...(job.checkIn ? { checkIn: Object.freeze({ ...job.checkIn }) } : {}),
 		...(job.contract
 			? {
 					contract: Object.freeze({
@@ -436,12 +443,12 @@ function cloneJob(job: SubagentJobRecord): SubagentJobRecord {
 
 function cloneInspection(
 	state: JobState,
-	metadata?: { queuePosition?: number; budget?: SubagentJobInspection["budget"] },
+	metadata?: { queuePosition?: number; scheduling?: SubagentJobInspection["scheduling"] },
 ): SubagentJobInspection {
 	return Object.freeze({
 		job: cloneJob(state.job),
 		...(metadata?.queuePosition !== undefined ? { queuePosition: metadata.queuePosition } : {}),
-		...(metadata?.budget ? { budget: Object.freeze({ ...metadata.budget }) } : {}),
+		...(metadata?.scheduling ? { scheduling: Object.freeze({ ...metadata.scheduling }) } : {}),
 		...(state.result ? { result: cloneResult(state.result) } : {}),
 	});
 }
@@ -748,7 +755,13 @@ function validJobRecord(value: unknown): value is SubagentJobRecord {
 			)
 				return false;
 		}
+		const checkInIntervalMs = contract.checkInIntervalMs;
+		const timeoutMs = contract.timeoutMs;
 		if (
+			(checkInIntervalMs !== undefined &&
+				(typeof checkInIntervalMs !== "number" ||
+					!Number.isSafeInteger(checkInIntervalMs) ||
+					checkInIntervalMs < 120_000)) ||
 			typeof contract.thinking !== "string" ||
 			Buffer.byteLength(contract.thinking) > 16 ||
 			(contract.temperature !== undefined &&
@@ -761,9 +774,12 @@ function validJobRecord(value: unknown): value is SubagentJobRecord {
 					!Number.isFinite(contract.topP) ||
 					contract.topP < 0 ||
 					contract.topP > 1)) ||
-			!["timeoutMs", "maxOutputBytes"].every(
-				(key) => typeof contract[key] === "number" && Number.isSafeInteger(contract[key]) && contract[key] >= 0,
-			) ||
+			(contract.maxOutputBytes !== undefined &&
+				(typeof contract.maxOutputBytes !== "number" ||
+					!Number.isSafeInteger(contract.maxOutputBytes) ||
+					contract.maxOutputBytes < 0)) ||
+			(timeoutMs !== undefined &&
+				(typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 0)) ||
 			!Array.isArray(contract.tools) ||
 			contract.tools.length > 64 ||
 			contract.tools.some((tool) => typeof tool !== "string" || Buffer.byteLength(tool) > 64) ||
@@ -819,7 +835,7 @@ function validJobRecord(value: unknown): value is SubagentJobRecord {
 		(typeof plannedOutputBytes !== "number" ||
 			!Number.isSafeInteger(plannedOutputBytes) ||
 			plannedOutputBytes <= 0 ||
-			plannedOutputBytes > SUBAGENT_JOB_OWNER_OUTPUT_BUDGET)
+			plannedOutputBytes > LEGACY_JOB_OWNER_OUTPUT_BUDGET)
 	)
 		return false;
 	if (
@@ -827,7 +843,7 @@ function validJobRecord(value: unknown): value is SubagentJobRecord {
 		(typeof reservedOutputBytes !== "number" ||
 			!Number.isSafeInteger(reservedOutputBytes) ||
 			reservedOutputBytes < 0 ||
-			reservedOutputBytes > SUBAGENT_JOB_OWNER_OUTPUT_BUDGET)
+			reservedOutputBytes > LEGACY_JOB_OWNER_OUTPUT_BUDGET)
 	)
 		return false;
 	if (
@@ -841,6 +857,27 @@ function validJobRecord(value: unknown): value is SubagentJobRecord {
 	if (value.startedAt !== undefined && !isIsoDate(value.startedAt)) return false;
 	if (value.finishedAt !== undefined && !isIsoDate(value.finishedAt)) return false;
 	if (value.runId !== undefined && !isJobId(value.runId)) return false;
+	if (value.checkIn !== undefined) {
+		const checkIn = value.checkIn;
+		if (!isRecord(checkIn)) return false;
+		if (
+			Object.keys(checkIn).some(
+				(key) => !["sequence", "lastAcknowledgedAt", "pendingSince", "overdueSince"].includes(key),
+			)
+		)
+			return false;
+		if (typeof checkIn.sequence !== "number" || !Number.isSafeInteger(checkIn.sequence) || checkIn.sequence < 0)
+			return false;
+		for (const key of ["lastAcknowledgedAt", "pendingSince", "overdueSince"] as const) {
+			const timestamp = checkIn[key];
+			if (
+				timestamp !== undefined &&
+				(typeof timestamp !== "number" || !Number.isSafeInteger(timestamp) || timestamp < 0)
+			)
+				return false;
+		}
+		if (checkIn.overdueSince !== undefined && checkIn.pendingSince === undefined) return false;
+	}
 	if ((status === "created" || status === "queued") && value.runId !== undefined) return false;
 	if (status === "created" && (value.startedAt !== undefined || value.finishedAt !== undefined)) return false;
 	if (status === "queued" && (value.startedAt !== undefined || value.finishedAt !== undefined)) return false;
@@ -867,6 +904,11 @@ function normalizePersistedSnapshot(value: unknown): unknown {
 	let changed = false;
 	if (isRecord(normalized.job)) {
 		const job = { ...normalized.job };
+		if (Object.hasOwn(job, "plannedOutputBytes") || Object.hasOwn(job, "reservedOutputBytes")) {
+			delete job.plannedOutputBytes;
+			delete job.reservedOutputBytes;
+			changed = true;
+		}
 		if (isRecord(job.contract)) {
 			const obsoleteKeys = new Set(["maxTotalTokens", "maxTurns", "maxToolCalls"]);
 			const contract = Object.fromEntries(Object.entries(job.contract).filter(([key]) => !obsoleteKeys.has(key)));
@@ -1055,7 +1097,6 @@ export class SubagentJobRegistry {
 	private readonly now: () => Date;
 	private readonly maxActiveJobs: number;
 	private readonly maxQueuedJobs: number;
-	private readonly maxAggregateOutputBytes: number;
 	private readonly reportArtifactRoot: string;
 	private readonly admission?: SubagentConcurrencyAdmission;
 	private readonly listeners = new Set<() => void>();
@@ -1066,7 +1107,6 @@ export class SubagentJobRegistry {
 	private readonly sequences = new Map<string, number>();
 	private readonly order = new Map<string, number>();
 	private orderCounter = 0;
-	private reservedOutputBytes = 0;
 	private pumping = false;
 	private schedulerPauseDepth = 0;
 	private shuttingDown = false;
@@ -1078,7 +1118,6 @@ export class SubagentJobRegistry {
 		}
 		const maxActiveJobs = options.maxActiveJobs ?? SUBAGENT_JOB_DEFAULT_CONCURRENCY;
 		const maxQueuedJobs = options.maxQueuedJobs ?? SUBAGENT_JOB_QUEUE_LIMIT;
-		const maxAggregateOutputBytes = options.maxAggregateOutputBytes ?? SUBAGENT_JOB_OWNER_OUTPUT_BUDGET;
 		const reportArtifactRoot = options.reportArtifactRoot ?? join(getAgentDir(), "artifacts", "subagent");
 		if (
 			typeof reportArtifactRoot !== "string" ||
@@ -1099,23 +1138,12 @@ export class SubagentJobRegistry {
 				`Queued background job limit must be between 0 and ${SUBAGENT_JOB_QUEUE_LIMIT}.`,
 			);
 		}
-		if (
-			!Number.isSafeInteger(maxAggregateOutputBytes) ||
-			maxAggregateOutputBytes < 1 ||
-			maxAggregateOutputBytes > SUBAGENT_JOB_OWNER_OUTPUT_BUDGET
-		) {
-			throw new SubagentJobError(
-				"job_invalid",
-				`Aggregate background output budget must be between 1 and ${SUBAGENT_JOB_OWNER_OUTPUT_BUDGET} bytes.`,
-			);
-		}
 		this.ownerSessionId = options.ownerSessionId;
 		this.persistSnapshot = options.persist;
 		this.notifyCompletion = options.notify;
 		this.now = options.now ?? (() => new Date());
 		this.maxActiveJobs = maxActiveJobs;
 		this.maxQueuedJobs = maxQueuedJobs;
-		this.maxAggregateOutputBytes = maxAggregateOutputBytes;
 		this.reportArtifactRoot = resolve(reportArtifactRoot);
 		this.admission = options.admission;
 		// Shared-admission wakeup: when a batch or another job releases a permit,
@@ -1128,12 +1156,48 @@ export class SubagentJobRegistry {
 		return () => this.listeners.delete(listener);
 	}
 
+	updateCheckInState(
+		jobId: string,
+		state:
+			| {
+					sequence: number;
+					lastAcknowledgedAt?: number;
+					pendingSince?: number;
+					overdueSince?: number;
+			  }
+			| undefined,
+	): boolean {
+		const record = this.records.get(jobId);
+		if (!record) return false;
+		const previous = record.job.checkIn;
+		const next: SubagentJobCheckInMetadata | undefined = state
+			? {
+					sequence: state.sequence,
+					...(state.lastAcknowledgedAt !== undefined ? { lastAcknowledgedAt: state.lastAcknowledgedAt } : {}),
+					...(state.pendingSince !== undefined ? { pendingSince: state.pendingSince } : {}),
+					...(state.overdueSince !== undefined ? { overdueSince: state.overdueSince } : {}),
+				}
+			: previous
+				? {
+						sequence: previous.sequence,
+						...(previous.lastAcknowledgedAt !== undefined
+							? { lastAcknowledgedAt: previous.lastAcknowledgedAt }
+							: {}),
+					}
+				: undefined;
+		if (JSON.stringify(previous) === JSON.stringify(next)) return true;
+		const { checkIn: _discarded, ...baseJob } = record.job;
+		record.job = next ? { ...baseJob, checkIn: next } : baseJob;
+		this.persistState(record);
+		this.publishChange();
+		return true;
+	}
+
 	launch(input: {
 		launchLeafId: string | null;
 		role: string;
 		model?: string;
 		contract?: SubagentJobContract;
-		plannedOutputBytes?: number;
 		run: (signal: AbortSignal) => Promise<SubagentJobRunResult>;
 	}): SubagentJobAccepted {
 		if (this.shuttingDown) throw new SubagentJobError("job_invalid", "Subagent job registry is shutting down.");
@@ -1145,19 +1209,6 @@ export class SubagentJobRegistry {
 		}
 		if (typeof input.role !== "string" || input.role.length === 0 || typeof input.run !== "function") {
 			throw new SubagentJobError("job_invalid", "Subagent job launch contract is invalid.");
-		}
-		const plannedOutputBytes = input.plannedOutputBytes ?? SUBAGENT_JOB_DEFAULT_OUTPUT_BYTES;
-		if (!Number.isSafeInteger(plannedOutputBytes) || plannedOutputBytes <= 0) {
-			throw new SubagentJobError("job_invalid", "Planned background output must be a positive safe integer.");
-		}
-		if (plannedOutputBytes > this.maxAggregateOutputBytes) {
-			throw new SubagentJobError(
-				"job_budget_exhausted",
-				"Planned background output exceeds the owner aggregate budget.",
-			);
-		}
-		if (this.reservedOutputBytes + plannedOutputBytes > this.maxAggregateOutputBytes) {
-			throw new SubagentJobError("job_budget_exhausted", "Owner aggregate background output budget is exhausted.");
 		}
 		const active = this.activeCount();
 		const queued = this.queuedCount();
@@ -1183,16 +1234,12 @@ export class SubagentJobRegistry {
 			createdAt,
 			...(status === "queued" ? { queuedAt: createdAt } : {}),
 			queueOrder,
-			plannedOutputBytes,
-			reservedOutputBytes: plannedOutputBytes,
 			resultRef: `job:${jobId}`,
 		};
 		const createdState: JobState = { job };
-		this.reservedOutputBytes += plannedOutputBytes;
 		try {
 			this.persistState(createdState);
 		} catch (error) {
-			this.reservedOutputBytes -= plannedOutputBytes;
 			this.orderCounter--;
 			if (admitted && this.admission) this.admission.release();
 			throw error;
@@ -1252,11 +1299,6 @@ export class SubagentJobRegistry {
 			await this.settle(live);
 			return this.inspect(jobId);
 		}
-		if (state.job.status === "needs_time") {
-			live.controller.abort();
-			await this.settle(live);
-			return this.inspect(jobId);
-		}
 		live.controller.abort();
 		await live.promise;
 		return this.inspect(jobId);
@@ -1276,15 +1318,10 @@ export class SubagentJobRegistry {
 			}
 			await Promise.all(selected.filter((live) => live.job.status === "queued").map((live) => this.settle(live)));
 			const active = selected.filter(
-				(live) =>
-					!live.settled &&
-					(live.job.status === "created" || live.job.status === "running" || live.job.status === "needs_time"),
+				(live) => !live.settled && (live.job.status === "created" || live.job.status === "running"),
 			);
 			for (const live of active) live.controller.abort();
-			await Promise.all(active.filter((live) => live.job.status === "needs_time").map((live) => this.settle(live)));
-			await Promise.all(
-				active.filter((live) => live.job.status !== "needs_time").map((live) => live.promise ?? Promise.resolve()),
-			);
+			await Promise.all(active.map((live) => live.promise ?? Promise.resolve()));
 		} finally {
 			this.schedulerPauseDepth--;
 			if (this.schedulerPauseDepth === 0) this.pump();
@@ -1301,7 +1338,6 @@ export class SubagentJobRegistry {
 		this.sequences.clear();
 		this.order.clear();
 		this.orderCounter = 0;
-		this.reservedOutputBytes = 0;
 		const latest = new Map<string, { snapshot: PersistedSubagentJobSnapshot; order: number; normalized: boolean }>();
 		let entryOrder = 0;
 		for (const entry of entries) {
@@ -1335,15 +1371,24 @@ export class SubagentJobRegistry {
 		const notifications: string[] = [];
 		for (const state of [...this.records.values()]) {
 			if (!isTerminal(state.job.status)) {
+				const restoredCheckIn = state.job.checkIn
+					? {
+							sequence: state.job.checkIn.sequence,
+							...(state.job.checkIn.lastAcknowledgedAt !== undefined
+								? { lastAcknowledgedAt: state.job.checkIn.lastAcknowledgedAt }
+								: {}),
+						}
+					: undefined;
 				state.job = {
 					...state.job,
 					status: "interrupted",
 					finishedAt: this.now().toISOString(),
-					reservedOutputBytes: 0,
+					...(restoredCheckIn ? { checkIn: restoredCheckIn } : {}),
 				};
 				state.result = {
 					schemaVersion: 1,
 					jobId: state.job.jobId,
+					...(state.job.runId ? { runId: state.job.runId } : {}),
 					status: "interrupted",
 					diagnostics: [
 						{ code: "job_runtime_interrupted", message: "Job runtime disappeared before completion." },
@@ -1397,16 +1442,13 @@ export class SubagentJobRegistry {
 			await this.settle(live);
 		}
 		const active = [...this.live.values()].filter(
-			(live) => live.job.status === "created" || live.job.status === "running" || live.job.status === "needs_time",
+			(live) => live.job.status === "created" || live.job.status === "running",
 		);
 		for (const live of active) {
 			if (!live.requestedStop) live.requestedStop = "interrupted";
 			live.controller.abort();
 		}
-		await Promise.all(active.filter((live) => live.job.status === "needs_time").map((live) => this.settle(live)));
-		await Promise.all(
-			active.filter((live) => live.job.status !== "needs_time").map((live) => live.promise ?? Promise.resolve()),
-		);
+		await Promise.all(active.map((live) => live.promise ?? Promise.resolve()));
 	}
 
 	private assertOwner(requesterSessionId: string): void {
@@ -1470,22 +1512,6 @@ export class SubagentJobRegistry {
 		await this.handleRunOutcome(live, runResult, runtimeError);
 	}
 
-	/** Keep a durable job aligned with a retained runtime supervisor. */
-	markManagedRunState(runId: string, state: "running" | "needs_time"): boolean {
-		const live = [...this.live.values()].find((candidate) => candidate.job.runId === runId);
-		if (!live || live.settled) return false;
-		if (state === "running" && live.job.status !== "needs_time") return false;
-		// Retained managed runs keep their admission permit while awaiting an
-		// extension. This makes needs_time an active state and prevents resumed
-		// work from racing with a newly admitted sibling.
-		live.job = { ...live.job, status: state, runId };
-		this.records.set(live.job.jobId, live);
-		this.persistState(live);
-		this.publishChange();
-		this.pump();
-		return true;
-	}
-
 	async resolveManagedRun(runId: string, runResult: SubagentJobRunResult): Promise<boolean> {
 		const live = [...this.live.values()].find((candidate) => candidate.job.runId === runId);
 		if (!live || live.settled) return false;
@@ -1499,20 +1525,6 @@ export class SubagentJobRegistry {
 		runtimeError?: unknown,
 	): Promise<void> {
 		if (live.settled) return;
-		if (!live.requestedStop && runResult?.result.status === "needs_time") {
-			// The retained child remains active and owns its permit until a terminal
-			// result or explicit cancellation settles it.
-			live.job = {
-				...live.job,
-				status: "needs_time",
-				runId: runResult.result.runId,
-			};
-			this.records.set(live.job.jobId, live);
-			this.persistState(live);
-			this.publishChange();
-			this.pump();
-			return;
-		}
 		await this.settle(live, runResult, runtimeError);
 	}
 
@@ -1524,16 +1536,13 @@ export class SubagentJobRegistry {
 			this.admission?.release();
 		}
 		const result = projectResult(live.job.jobId, live.requestedStop, runResult, runtimeError, live.job.runId);
-		const reservedOutputBytes = live.job.reservedOutputBytes ?? 0;
 		if (runResult?.result.runId) live.job = { ...live.job, runId: runResult.result.runId };
 		live.job = {
 			...live.job,
 			status: result.status,
 			finishedAt: this.now().toISOString(),
-			reservedOutputBytes: 0,
 		};
 		live.result = result;
-		this.releaseReservation(reservedOutputBytes);
 		this.records.set(live.job.jobId, live);
 		try {
 			this.persistState(live);
@@ -1570,14 +1579,11 @@ export class SubagentJobRegistry {
 			live.holdsPermit = false;
 			this.admission?.release();
 		}
-		const reservedOutputBytes = live.job.reservedOutputBytes ?? 0;
 		live.job = {
 			...live.job,
 			status: "failed",
 			finishedAt: this.now().toISOString(),
-			reservedOutputBytes: 0,
 		};
-		this.releaseReservation(reservedOutputBytes);
 		this.records.set(live.job.jobId, {
 			job: live.job,
 			result: {
@@ -1599,10 +1605,6 @@ export class SubagentJobRegistry {
 				// UI subscribers are non-authoritative and must not affect durable execution.
 			}
 		}
-	}
-
-	private releaseReservation(reserved: number): void {
-		this.reservedOutputBytes = Math.max(0, this.reservedOutputBytes - reserved);
 	}
 
 	private pump(): void {
@@ -1631,9 +1633,8 @@ export class SubagentJobRegistry {
 	}
 
 	private activeCount(): number {
-		return [...this.live.values()].filter(
-			(live) => live.job.status === "created" || live.job.status === "running" || live.job.status === "needs_time",
-		).length;
+		return [...this.live.values()].filter((live) => live.job.status === "created" || live.job.status === "running")
+			.length;
 	}
 
 	private queuedCount(): number {
@@ -1650,18 +1651,10 @@ export class SubagentJobRegistry {
 				: undefined;
 		return cloneInspection(state, {
 			...(queuePosition && queuePosition > 0 ? { queuePosition } : {}),
-			budget: {
-				plannedOutputBytes: state.job.plannedOutputBytes ?? 0,
-				reservedOutputBytes: state.job.reservedOutputBytes ?? 0,
-				ownerReservedOutputBytes: this.reservedOutputBytes,
-				ownerBudgetBytes: this.maxAggregateOutputBytes,
-				...(this.admission
-					? {
-							ownerActiveJobs: this.admission.active,
-							ownerQueuedJobs: this.queuedCount(),
-							ownerActiveJobsCap: Math.min(this.maxActiveJobs, this.admission.capacity),
-						}
-					: {}),
+			scheduling: {
+				ownerActiveJobs: this.admission?.active ?? this.activeCount(),
+				ownerQueuedJobs: this.queuedCount(),
+				ownerActiveJobsCap: Math.min(this.maxActiveJobs, this.admission?.capacity ?? this.maxActiveJobs),
 			},
 		});
 	}

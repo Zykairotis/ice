@@ -464,6 +464,9 @@ export class InteractiveMode {
 	// Skill commands: command name -> skill file path
 	private skillCommands = new Map<string, string>();
 
+	// Hot-reload poll timer for skill additions, updates, and deletions
+	private skillReloadTimer: ReturnType<typeof setInterval> | undefined;
+
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
@@ -786,6 +789,19 @@ export class InteractiveMode {
 		);
 	}
 
+	/**
+	 * Poll skill sources so skills added, updated, or deleted on disk are picked up live:
+	 * reloads the session's skill set and rebuilds autocomplete with the new /skill:name commands.
+	 */
+	private startSkillReloadPolling(): void {
+		const skillReloadPollMs = 5_000;
+		this.skillReloadTimer = setInterval(() => {
+			if (this.session.refreshSkills()) {
+				this.setupAutocompleteProvider();
+			}
+		}, skillReloadPollMs);
+	}
+
 	private setupAutocompleteProvider(): void {
 		let provider = this.createBaseAutocompleteProvider();
 		const triggerCharacters: string[] = [];
@@ -1089,6 +1105,7 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<void> {
 		await this.init();
+		this.startSkillReloadPolling();
 
 		if (!process.env.ICE_OFFLINE) {
 			const controller = new AbortController();
@@ -2158,8 +2175,6 @@ export class InteractiveMode {
 			if (
 				(presentation.handoffMessageMarker && text.includes(presentation.handoffMessageMarker)) ||
 				(presentation.finalizationMessageMarker && text.includes(presentation.finalizationMessageMarker)) ||
-				(presentation.timeoutContinuationMessageMarker &&
-					text.includes(presentation.timeoutContinuationMessageMarker)) ||
 				(presentation.wrapUpMessageMarker && text.includes(presentation.wrapUpMessageMarker))
 			) {
 				return true;
@@ -7416,6 +7431,10 @@ export class InteractiveMode {
 	}
 
 	stop(): void {
+		if (this.skillReloadTimer) {
+			clearInterval(this.skillReloadTimer);
+			this.skillReloadTimer = undefined;
+		}
 		// ICE currently permits one interactive runtime per process. Restore the
 		// TUI process default so tests/embedded consumers never inherit this
 		// session's appearance table style after teardown.

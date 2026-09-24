@@ -1487,3 +1487,49 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(messages[0].role).toBe("assistant");
 	});
 });
+
+describe("abort classification", () => {
+	it("reclassifies an error response as aborted when the run signal is already aborted", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const controller = new AbortController();
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			// Emulate a provider that raced the abort: the request settles with an
+			// error stop reason even though the run signal is already aborted.
+			controller.abort();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([]);
+				message.stopReason = "error";
+				message.errorMessage = "This operation was aborted";
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("Hello")], context, config, controller.signal, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		const assistant = messages.find((message) => message.role === "assistant") as AssistantMessage;
+		expect(assistant.stopReason).toBe("aborted");
+
+		const messageEndEvents = events.filter((event) => event.type === "message_end");
+		const assistantEnd = messageEndEvents
+			.map((event) => (event as { message: AssistantMessage }).message)
+			.find((message) => message.role === "assistant");
+		expect(assistantEnd?.stopReason).toBe("aborted");
+	});
+});

@@ -765,6 +765,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "get_commands": {
+				// Hot-reload skills so the command list reflects additions, updates, and deletions.
+				session.refreshSkills();
 				const commands: RpcSlashCommand[] = [];
 
 				// Built-in /settings command
